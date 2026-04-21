@@ -272,7 +272,7 @@ def build_sighting_fields(at_fields, garment_webflow_id):
         item_id = listing_url.split("?")[0].rstrip("/").split("/")[-1]
         if item_id and name:
             clean = re.sub(r'[^a-z0-9]+', '-', clean_name(name).lower()).strip('-')
-            fields["slug"] = f"{clean}-{item_id[-6:]}"
+            fields["slug"] = f"{clean}-{item_id[-10:]}"
 
     for at_key, wf_slug in {
         "Platform":  "platform",
