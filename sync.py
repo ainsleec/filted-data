@@ -444,11 +444,7 @@ def main():
 
     priority_garments = [
         r for r in all_garments
-        if has_image(r) and (
-            r["id"] in sighting_garment_ids
-            or (DESIGNER_FILTER and any(d in get_garment_designer(r["fields"]).lower() for d in df_lower))
-            or not DESIGNER_FILTER
-        )
+        if has_image(r) and r["id"] in sighting_garment_ids
     ]
     priority_garment_ids = {r["id"] for r in priority_garments}
     print(f"  {len(priority_garments)} priority garments (with image)\n")
