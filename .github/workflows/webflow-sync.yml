@@ -1,0 +1,30 @@
+name: Webflow Sync
+
+on:
+  schedule:
+    - cron: '0 21 * * *'   # 7am AEST (UTC+10)
+    - cron: '0 9 * * *'    # 7pm AEST (UTC+10)
+  workflow_dispatch:         # allows manual trigger from GitHub Actions tab
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests pyairtable
+
+      - name: Run sync
+        env:
+          AIRTABLE_API_KEY:  ${{ secrets.AIRTABLE_API_KEY }}
+          WEBFLOW_API_TOKEN: ${{ secrets.WEBFLOW_API_TOKEN }}
+          GH_PAT:            ${{ secrets.GH_PAT }}
+        run: python sync.py
