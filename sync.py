@@ -410,10 +410,11 @@ def main():
     sold_sightings    = []
     expired_sightings = []
     for r in all_sightings:
-        status = r["fields"].get("Status")
-        if status == ACTIVE_STATUS and r["fields"].get("Garment"):
+        status   = r["fields"].get("Status")
+        verified = r["fields"].get("Verified", False)
+        if status == ACTIVE_STATUS and r["fields"].get("Garment") and verified:
             active_sightings.append(r)
-        elif status == SOLD_STATUS and r["fields"].get("Garment"):
+        elif status == SOLD_STATUS and r["fields"].get("Garment") and verified:
             sold_sightings.append(r)
         elif status == EXPIRED_STATUS and r["fields"].get("Garment"):
             expired_sightings.append(r)
