@@ -414,7 +414,7 @@ def main():
         verified = r["fields"].get("Verified", False)
         if status == ACTIVE_STATUS and r["fields"].get("Garment") and verified:
             active_sightings.append(r)
-        elif status == SOLD_STATUS and r["fields"].get("Garment") and verified:
+        elif status == SOLD_STATUS and r["fields"].get("Garment"):
             sold_sightings.append(r)
         elif status == EXPIRED_STATUS and r["fields"].get("Garment"):
             expired_sightings.append(r)
