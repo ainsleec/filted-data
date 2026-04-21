@@ -2,8 +2,8 @@ name: Webflow Sync
 
 on:
   schedule:
-    - cron: '0 21 * * *'   # 7am AEST (UTC+10)
-    - cron: '0 9 * * *'    # 7pm AEST (UTC+10)
+    - cron: '0 22 * * *'   # 8am AEST (UTC+10)
+    - cron: '0 11 * * *'    # 9pm AEST (UTC+10)
   workflow_dispatch:         # allows manual trigger from GitHub Actions tab
 
 jobs:
