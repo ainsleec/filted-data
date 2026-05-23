@@ -139,7 +139,7 @@ def add_sightings(new_items):
             added += len(batch)
         else:
             print(f"  ⚠️  Airtable batch error: {resp.text[:300]}")
-        time.sleep(0.3)
+        time.sleep(2)
 
     return added
 
