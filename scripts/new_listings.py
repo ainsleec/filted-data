@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
 Filted — New eBay Listings Scraper
-Runs twice daily on PythonAnywhere (7am + 7pm AEST).
+Runs twice daily on GitHub Actions (7am + 7pm AEST).
 
 Searches eBay AU strictly within Women's Clothing (category 15724).
+Uses Browse API (same OAuth flow as expiry checker — no separate App ID needed).
 Adds new unmatched sightings to Airtable Resale Sightings table.
-Unmatched = no garment link yet, but visible in live feed.
 """
 
-import os, requests, time
+import os, requests, time, base64
 from datetime import datetime, timezone, timedelta
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -17,14 +17,14 @@ AIRTABLE_BASE       = os.environ["AIRTABLE_BASE"]
 DESIGNERS_TABLE     = os.environ.get("DESIGNERS_TABLE", "Designers")
 SIGHTINGS_TABLE     = os.environ["RESALE_SIGHTINGS_TABLE"]
 
-EBAY_APP_ID         = os.environ["EBAY_APP_ID"]   # Client ID from eBay Developer portal
+EBAY_CLIENT_ID      = os.environ["EBAY_CLIENT_ID"]
+EBAY_CLIENT_SECRET  = os.environ["EBAY_CLIENT_SECRET"]
 
 # ── eBay strict settings ──────────────────────────────────────────────────────
-EBAY_WOMENS_CAT     = "15724"    # eBay AU: Women's Clothing — no other categories accepted
-LOOKBACK_HOURS      = 14         # Runs twice daily, 14hr window catches everything with overlap
+EBAY_WOMENS_CAT     = "15724"    # eBay AU: Women's Clothing — no other categories
+LOOKBACK_HOURS      = 14         # Runs twice daily, 14hr window with overlap
 MAX_PER_DESIGNER    = 100        # Cap per designer per run
 
-# These title keywords indicate non-women's items slipping through — skip them
 TITLE_EXCLUSIONS = [
     "kids", "girls", "boys", "baby", "toddler", "junior",
     "men's", "mens", "unisex", "costume", "cosplay",
@@ -39,14 +39,32 @@ HEADERS_AT = {
     "Content-Type":  "application/json"
 }
 
+# ── eBay OAuth ────────────────────────────────────────────────────────────────
+def get_ebay_token():
+    """Fetch a fresh eBay OAuth token via client credentials. Valid ~2hrs."""
+    credentials = base64.b64encode(
+        f"{EBAY_CLIENT_ID}:{EBAY_CLIENT_SECRET}".encode()
+    ).decode()
+    resp = requests.post(
+        "https://api.ebay.com/identity/v1/oauth2/token",
+        headers={
+            "Authorization": f"Basic {credentials}",
+            "Content-Type":  "application/x-www-form-urlencoded"
+        },
+        data="grant_type=client_credentials&scope=https://api.ebay.com/oauth/api_scope",
+        timeout=15
+    )
+    resp.raise_for_status()
+    token = resp.json().get("access_token")
+    if not token:
+        raise RuntimeError(f"Token fetch failed: {resp.text}")
+    print("   ✅ eBay token refreshed")
+    return token
+
+
 # ── Airtable helpers ──────────────────────────────────────────────────────────
 def fetch_designers():
-    """
-    Pull all active designer names from Airtable Designers table.
-    Uses 'eBay Search Term' field if set (allows custom search strings),
-    falls back to 'Name'. This means adding a designer to Airtable
-    automatically picks it up here — no script changes needed.
-    """
+    """Pull all designer names from Airtable Designers table."""
     designers = []
     params = {
         "fields[]": ["Designer Name"],
@@ -60,10 +78,9 @@ def fetch_designers():
         resp.raise_for_status()
         data = resp.json()
         for rec in data.get("records", []):
-            f    = rec["fields"]
-            term = f.get("Designer Name", "")
-            if term.strip():
-                designers.append(term.strip())
+            name = rec["fields"].get("Designer Name", "").strip()
+            if name:
+                designers.append(name)
         if not data.get("offset"):
             break
         params["offset"] = data["offset"]
@@ -71,10 +88,7 @@ def fetch_designers():
 
 
 def fetch_existing_item_ids():
-    """
-    Load all eBay Item IDs already stored in Airtable.
-    Used to skip duplicates without hitting eBay API again.
-    """
+    """Load all eBay Item IDs already in Airtable to skip duplicates."""
     item_ids = set()
     params = {
         "fields[]": ["eBay Item ID"],
@@ -109,14 +123,13 @@ def add_sightings(new_items):
             fields = {
                 "eBay Item ID":  item["item_id"],
                 "Listing URL":   item["url"],
-                "eBay Title":    item["title"][:500],   # Airtable text field limit safety
+                "eBay Title":    item["title"][:500],
                 "Date Listed":   item["date_listed"],
                 "Status":        "Active",
                 "Seller Name":   item["seller"],
             }
             if item.get("price") is not None:
                 fields["Listed Price"] = item["price"]
-            # Gallery URL works as an attachment — low-res but fine for unmatched feed
             if item.get("image_url"):
                 fields["Main Image"] = [{"url": item["image_url"]}]
             records.append({"fields": fields})
@@ -131,95 +144,82 @@ def add_sightings(new_items):
     return added
 
 
-# ── eBay Finding API ──────────────────────────────────────────────────────────
-def search_ebay(keyword, since_hours):
+# ── eBay Browse API search ────────────────────────────────────────────────────
+def search_ebay(keyword, ebay_headers, since_hours):
     """
-    Search eBay AU Finding API.
-    STRICT: category 15724 (Women's Clothing) only, AU located, Fixed Price only.
-    Returns list of raw item dicts.
+    Search eBay AU Browse API.
+    STRICT: category 15724 (Women's Clothing) only, AU only, newly listed.
+    Returns list of item summary dicts.
     """
-    since_dt = (
-        datetime.now(timezone.utc) - timedelta(hours=since_hours)
-    ).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-
-    params = {
-        "OPERATION-NAME":                   "findItemsAdvanced",
-        "SERVICE-VERSION":                  "1.13.0",
-        "SECURITY-APPNAME":                 EBAY_APP_ID,
-        "RESPONSE-DATA-FORMAT":             "JSON",
-        "GLOBAL-ID":                        "EBAY-AU",
-        # ── Strict category — Women's Clothing only ──────────────────────────
-        "categoryId":                       EBAY_WOMENS_CAT,
-        "keywords":                         keyword,
-        "sortOrder":                        "StartTimeNewest",
-        # ── Filters ──────────────────────────────────────────────────────────
-        "itemFilter(0).name":               "ListingType",
-        "itemFilter(0).value":              "FixedPrice",
-        "itemFilter(1).name":               "StartTimeFrom",
-        "itemFilter(1).value":              since_dt,
-        "itemFilter(2).name":               "LocatedIn",
-        "itemFilter(2).value":              "AU",
-        "itemFilter(3).name":               "MinPrice",
-        "itemFilter(3).value":              "20",        # Skip obvious junk / accessories
-        "itemFilter(3).paramName":          "Currency",
-        "itemFilter(3).paramValue":         "AUD",
-        "paginationInput.entriesPerPage":   str(MAX_PER_DESIGNER),
-    }
-
     try:
         resp = requests.get(
-            "https://svcs.ebay.com/services/search/FindingService/v1",
-            params=params, timeout=20
+            "https://api.ebay.com/buy/browse/v1/item_summary/search",
+            headers=ebay_headers,
+            params={
+                "q":            keyword,
+                "category_ids": EBAY_WOMENS_CAT,
+                "filter":       "itemLocationCountry:AU,price:[20..],priceCurrency:AUD",
+                "sort":         "newlyListed",
+                "limit":        str(MAX_PER_DESIGNER),
+            },
+            timeout=20
         )
-        resp.raise_for_status()
-        data         = resp.json()
-        search_resp  = data.get("findItemsAdvancedResponse", [{}])[0]
-        ack          = search_resp.get("ack", ["Failure"])[0]
-        if ack != "Success":
-            err = search_resp.get("errorMessage", [{}])[0].get("error", [{}])[0].get("message", ["Unknown"])[0]
-            print(f"  eBay error for '{keyword}': {err}")
+        if not resp.ok:
+            print(f"  eBay error for '{keyword}': {resp.status_code} {resp.text[:200]}")
             return []
-        items_wrap = search_resp.get("searchResult", [{}])[0]
-        return items_wrap.get("item", [])
+        return resp.json().get("itemSummaries", [])
     except Exception as e:
         print(f"  Exception searching '{keyword}': {e}")
         return []
 
 
+def is_new_enough(item, since_hours):
+    """Return True if item was listed within the lookback window."""
+    date_str = item.get("itemCreationDate", "")
+    if not date_str:
+        return True  # Can't tell, include it
+    try:
+        listed_dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        cutoff    = datetime.now(timezone.utc) - timedelta(hours=since_hours)
+        return listed_dt >= cutoff
+    except Exception:
+        return True
+
+
 def is_excluded(title):
-    """Return True if title contains a keyword indicating a non-women's-clothing item."""
+    """Return True if title suggests a non-clothing item."""
     t = title.lower()
     return any(excl in t for excl in TITLE_EXCLUSIONS)
 
 
 def parse_item(raw, designer_name):
-    """Extract clean fields from a Finding API item dict."""
-    def v(field, default=""):
-        val = raw.get(field, [default])
-        return val[0] if isinstance(val, list) else val
+    """Extract clean fields from a Browse API item summary dict."""
+    # Browse API returns v1|ITEMID|0 — extract numeric ID
+    raw_id  = raw.get("itemId", "")
+    parts   = raw_id.split("|")
+    item_id = parts[1] if len(parts) >= 2 else raw_id
 
-    item_id    = v("itemId")
-    title      = v("title")
-    url        = v("viewItemURL")
-    image_url  = v("galleryURL")
-    seller     = raw.get("sellerInfo", [{}])[0].get("sellerUserName", [""])[0]
-    price_raw  = raw.get("sellingStatus", [{}])[0].get("currentPrice", [{}])[0].get("__value__")
-    start_time = raw.get("listingInfo", [{}])[0].get("startTime", [""])[0]
+    title     = raw.get("title", "")
+    url       = raw.get("itemWebUrl", "")
+    image_url = raw.get("image", {}).get("imageUrl", "")
+    seller    = raw.get("seller", {}).get("username", "")
+    price_val = raw.get("price", {}).get("value")
+    date_str  = raw.get("itemCreationDate", "")
 
     try:
-        price = float(price_raw) if price_raw else None
+        price = float(price_val) if price_val else None
     except (ValueError, TypeError):
         price = None
 
     try:
         date_listed = datetime.fromisoformat(
-            start_time.replace("Z", "+00:00")
+            date_str.replace("Z", "+00:00")
         ).strftime("%Y-%m-%d")
     except Exception:
         date_listed = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     return {
-        "item_id":     str(item_id).strip(),
+        "item_id":     item_id.strip(),
         "title":       title,
         "url":         url,
         "price":       price,
@@ -236,7 +236,14 @@ def main():
     print(f"🛍  Filted — New Listings Scrape")
     print(f"    {run_start.strftime('%Y-%m-%d %H:%M UTC')}  |  Category: Women's Clothing ({EBAY_WOMENS_CAT}) ONLY\n")
 
-    print("📋 Fetching designers from Airtable...")
+    print("🔑 Fetching eBay OAuth token...")
+    ebay_token = get_ebay_token()
+    ebay_headers = {
+        "Authorization":           f"Bearer {ebay_token}",
+        "X-EBAY-C-MARKETPLACE-ID": "EBAY_AU"
+    }
+
+    print("\n📋 Fetching designers from Airtable...")
     designers = fetch_designers()
     print(f"   {len(designers)} designer(s): {', '.join(designers)}\n")
 
@@ -244,31 +251,36 @@ def main():
     existing_ids = fetch_existing_item_ids()
     print(f"   {len(existing_ids)} existing sightings\n")
 
-    all_new       = []
-    total_found   = 0
-    total_excluded= 0
-    total_dupes   = 0
+    all_new        = []
+    total_found    = 0
+    total_old      = 0
+    total_excluded = 0
+    total_dupes    = 0
 
     print(f"🔍 Searching eBay AU (last {LOOKBACK_HOURS}hrs)...")
     for designer in designers:
-        raw_items = search_ebay(designer, since_hours=LOOKBACK_HOURS)
+        raw_items = search_ebay(designer, ebay_headers, since_hours=LOOKBACK_HOURS)
         new_count = 0
 
         for raw in raw_items:
             total_found += 1
+
+            # Skip if outside lookback window
+            if not is_new_enough(raw, LOOKBACK_HOURS):
+                total_old += 1
+                continue
+
             item = parse_item(raw, designer)
 
-            # Strict title exclusion check
             if is_excluded(item["title"]):
                 total_excluded += 1
                 continue
 
-            # Skip if already in Airtable
             if item["item_id"] in existing_ids:
                 total_dupes += 1
                 continue
 
-            existing_ids.add(item["item_id"])  # Prevent within-run dupes
+            existing_ids.add(item["item_id"])
             all_new.append(item)
             new_count += 1
 
@@ -278,7 +290,7 @@ def main():
             print(f"   {designer}: no results")
         time.sleep(0.5)
 
-    print(f"\n   Total found: {total_found} | Category-excluded: {total_excluded} | Dupes: {total_dupes} | New: {len(all_new)}")
+    print(f"\n   Total found: {total_found} | Too old: {total_old} | Excluded: {total_excluded} | Dupes: {total_dupes} | New: {len(all_new)}")
 
     if all_new:
         print(f"\n📝 Adding {len(all_new)} new sightings to Airtable (unmatched)...")
