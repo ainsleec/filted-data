@@ -49,7 +49,7 @@ def fetch_designers():
     """
     designers = []
     params = {
-        "fields[]": ["Name"],
+        "fields[]": ["Designer Name"],
         "pageSize": 100
     }
     while True:
@@ -61,7 +61,7 @@ def fetch_designers():
         data = resp.json()
         for rec in data.get("records", []):
             f    = rec["fields"]
-            term = f.get("eBay Search Term") or f.get("Name", "")
+            term = f.get("Designer Name", "")
             if term.strip():
                 designers.append(term.strip())
         if not data.get("offset"):
