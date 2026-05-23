@@ -1,0 +1,33 @@
+name: New eBay Listings
+
+on:
+  schedule:
+    - cron: '0 21 * * *'   # 7am AEST (UTC+10)
+    - cron: '0 9 * * *'    # 7pm AEST (UTC+10)
+  workflow_dispatch:         # Allows manual trigger from GitHub Actions tab
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run new listings scraper
+        env:
+          AIRTABLE_TOKEN:         ${{ secrets.AIRTABLE_TOKEN }}
+          AIRTABLE_BASE:          ${{ secrets.AIRTABLE_BASE }}
+          RESALE_SIGHTINGS_TABLE: ${{ secrets.RESALE_SIGHTINGS_TABLE }}
+          DESIGNERS_TABLE:        ${{ secrets.DESIGNERS_TABLE }}
+          EBAY_APP_ID:            ${{ secrets.EBAY_APP_ID }}
+        run: python scripts/new_listings.py
