@@ -1,0 +1,32 @@
+name: eBay Expiry Checker
+
+on:
+  schedule:
+    - cron: '0 16 * * *'   # 2am AEST (UTC+10)
+  workflow_dispatch:         # Allows manual trigger from GitHub Actions tab
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30      # Expiry checker can run longer with many sightings
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run expiry checker
+        env:
+          AIRTABLE_TOKEN:         ${{ secrets.AIRTABLE_TOKEN }}
+          AIRTABLE_BASE:          ${{ secrets.AIRTABLE_BASE }}
+          RESALE_SIGHTINGS_TABLE: ${{ secrets.RESALE_SIGHTINGS_TABLE }}
+          EBAY_CLIENT_ID:         ${{ secrets.EBAY_CLIENT_ID }}
+          EBAY_CLIENT_SECRET:     ${{ secrets.EBAY_CLIENT_SECRET }}
+        run: python scripts/expiry_checker.py
