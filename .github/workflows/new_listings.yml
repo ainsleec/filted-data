@@ -4,7 +4,7 @@ on:
   schedule:
     - cron: '0 21 * * *'   # 7am AEST (UTC+10)
     - cron: '0 9 * * *'    # 7pm AEST (UTC+10)
-  workflow_dispatch:         # Allows manual trigger from GitHub Actions tab
+  workflow_dispatch:
 
 jobs:
   scrape:
@@ -29,5 +29,6 @@ jobs:
           AIRTABLE_BASE:          ${{ secrets.AIRTABLE_BASE }}
           RESALE_SIGHTINGS_TABLE: ${{ secrets.RESALE_SIGHTINGS_TABLE }}
           DESIGNERS_TABLE:        ${{ secrets.DESIGNERS_TABLE }}
-          EBAY_APP_ID:            ${{ secrets.EBAY_APP_ID }}
+          EBAY_CLIENT_ID:         ${{ secrets.EBAY_CLIENT_ID }}
+          EBAY_CLIENT_SECRET:     ${{ secrets.EBAY_CLIENT_SECRET }}
         run: python scripts/new_listings.py
