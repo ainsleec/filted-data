@@ -49,7 +49,7 @@ def fetch_designers():
     """
     designers = []
     params = {
-        "fields[]": ["Name", "eBay Search Term"],
+        "fields[]": ["Name"],
         "pageSize": 100
     }
     while True:
