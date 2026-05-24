@@ -25,7 +25,7 @@ EBAY_CLIENT_SECRET    = os.environ["EBAY_CLIENT_SECRET"]
 
 MIN_AGE_DAYS          = 1      # Don't check listings newer than this
 RECHECK_DAYS          = 1      # Recheck listings not checked within this many days
-BATCH_LIMIT           = 4000   # Max sightings to process per run
+BATCH_LIMIT           = 2000   # Max sightings to process per run
 
 HEADERS_AT = {
     "Authorization": f"Bearer {AIRTABLE_TOKEN}",
