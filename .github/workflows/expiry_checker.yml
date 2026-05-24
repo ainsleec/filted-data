@@ -2,13 +2,14 @@ name: eBay Expiry Checker
 
 on:
   schedule:
-    - cron: '0 16 * * *'   # 2am AEST (UTC+10)
-  workflow_dispatch:         # Allows manual trigger from GitHub Actions tab
+    - cron: '0 14 * * *'   # 12am AEST
+    - cron: '0 2 * * *'    # 12pm AEST
+  workflow_dispatch:
 
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 30      # Expiry checker can run longer with many sightings
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repo
