@@ -131,7 +131,7 @@ def add_sightings(new_items):
             if item.get("price") is not None:
                 fields["Listed Price"] = item["price"]
             if item.get("image_url"):
-                fields["Main Image"] = [{"url": item["image_url"]}]
+                fields["eBay Image"] = [{"url": item["image_url"]}]
             records.append({"fields": fields})
 
         resp = requests.post(url_at, headers=HEADERS_AT, json={"records": records})
