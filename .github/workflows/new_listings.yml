@@ -2,8 +2,10 @@ name: New eBay Listings
 
 on:
   schedule:
-    - cron: '0 21 * * *'   # 7am AEST (UTC+10)
-    - cron: '0 9 * * *'    # 7pm AEST (UTC+10)
+    - cron: '0 22 * * *'     # 8am AEST (10pm UTC prev day)
+    - cron: '0 2 * * *'      # 12pm AEST (2am UTC)
+    - cron: '0 7 * * *'      # 5pm AEST (7am UTC)
+    - cron: '0 11 * * *'     # 9pm AEST (11am UTC)
   workflow_dispatch:
 
 jobs:
