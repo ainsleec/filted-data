@@ -34,19 +34,21 @@ HEADERS_WF = {
     'accept':        'application/json',
 }
 
-# Add designers here to include in sync
+# Add or remove designers here to control which are synced
 TARGET_DESIGNERS = ['Aje', 'Alemais']
 
-WF_DELAY = 0.3   # seconds between Webflow API calls
-AT_DELAY = 0.1   # seconds between Airtable API calls
+WF_DELAY = 0.3
+AT_DELAY = 0.1
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def get_str(value, default=''):
-    """Safely extract string from a value that may be a list or string."""
+    """Safely extract a string from a value that may be a list or scalar."""
+    if value is None:
+        return default
     if isinstance(value, list):
         return str(value[0]).strip() if value else default
-    return str(value).strip() if value else default
+    return str(value).strip()
 
 
 def slugify(text):
@@ -151,10 +153,8 @@ def wf_update_item(collection_id, item_id, field_data):
 
 # ── Content generation ────────────────────────────────────────────────────────
 def generate_garment_html(garments, designer_name, collection_name):
-    """Generate SEO-readable HTML table for Webflow Editorial Content field."""
     if not garments:
         return ''
-
     rows = '\n'.join(
         '<tr>'
         f'<td>{get_str(g["fields"].get("Product Code"))}</td>'
@@ -164,9 +164,7 @@ def generate_garment_html(garments, designer_name, collection_name):
         '</tr>'
         for g in garments
     )
-
     count = len(garments)
-
     return (
         f'<h2>{designer_name} {collection_name} — Full Garment List</h2>'
         f'<p>Complete garment reference for the {designer_name} {collection_name} collection. '
@@ -179,7 +177,6 @@ def generate_garment_html(garments, designer_name, collection_name):
 
 
 def generate_meta_description(garments, designer_name, collection_name):
-    """Generate SEO meta description from first 4 garment names."""
     count  = len(garments)
     sample = [
         get_str(g['fields'].get('Garment Name'))
@@ -201,35 +198,44 @@ def main():
     print(f'Filted Archive Sync — {datetime.now().strftime("%d %b %Y, %I:%M %p")}')
     print('=' * 60)
 
-    # 1. Load Webflow designer IDs (needed for reference field)
+    # 1. Load Webflow designer IDs
     print('\nLoading Webflow designers...')
-    wf_designers   = wf_get_all_items(WEBFLOW_DESIGNERS_ID)
+    wf_designers    = wf_get_all_items(WEBFLOW_DESIGNERS_ID)
     designer_wf_map = {}
     for d in wf_designers:
-        name = get_str(d.get('fieldData', {}).get('name', ''))
+        name = get_str(d.get('fieldData', {}).get('name'))
         if name:
             designer_wf_map[name.lower()] = d['id']
     print(f'  {len(designer_wf_map)} designers found')
 
-    # 2. Load Airtable collections
-    # Use FIND() because Designer Name is a lookup field (returns array)
+    # 2. Load ALL published collections from Airtable
+    # Designer Name is a lookup field so we filter in Python instead
     print('\nLoading Airtable collections...')
-    designer_finds  = ', '.join(f'FIND("{d}", {{Designer Name}})' for d in TARGET_DESIGNERS)
-    filter_formula  = f'AND({{Published}}=1, OR({designer_finds}))'
-
-    collections = at_get_all(
+    all_collections = at_get_all(
         'Collections',
-        filter_formula=filter_formula,
+        filter_formula='{Published}=1',
         fields=[
             'Collection Name', 'Designer Name', 'Season Code',
             'Release Date', 'Hero Image', 'Slug', 'Webflow Item ID',
         ],
         sort=[{'field': 'Designer Name'}, {'field': 'Collection Name'}],
     )
-    print(f'  {len(collections)} published collections found')
+    print(f'  {len(all_collections)} total published collections found')
+
+    # Filter to target designers in Python (avoids lookup field formula issues)
+    target_lower = [d.lower() for d in TARGET_DESIGNERS]
+    collections  = [
+        c for c in all_collections
+        if get_str(c['fields'].get('Designer Name')).lower() in target_lower
+    ]
+    print(f'  {len(collections)} collections for {", ".join(TARGET_DESIGNERS)}')
 
     if not collections:
-        print('\n  No collections found — check Published checkbox and Designer Name values in Airtable')
+        print('\n  No matching collections — check Designer Name values in Airtable')
+        print(f'  Looking for: {TARGET_DESIGNERS}')
+        print('  Sample of what was found:')
+        for c in all_collections[:5]:
+            print(f'    — {get_str(c["fields"].get("Designer Name"))} | {get_str(c["fields"].get("Collection Name"))}')
         return
 
     # 3. Sync each collection
@@ -243,13 +249,12 @@ def main():
         wf_item_id = get_str(f.get('Webflow Item ID'))
 
         if not col_name or not designer:
-            print(f'\n  Skipping record {col_id} — missing name or designer')
             skipped += 1
             continue
 
         print(f'\n  {designer} — {col_name}')
 
-        # Fetch garments with images for this collection
+        # Fetch garments with images
         garments = at_get_all(
             'All Garments',
             filter_formula=f'AND({{Collection}}="{col_name}", {{Image 1}}!="")',
@@ -264,11 +269,10 @@ def main():
 
         print(f'    {len(garments)} garments with images')
 
-        # Build Webflow field data
-        slug       = slugify(get_str(f.get('Slug')) or col_name)
-        hero_imgs  = f.get('Hero Image', [])
-        hero_url   = hero_imgs[0].get('url') if hero_imgs else None
-        wf_des_id  = designer_wf_map.get(designer.lower())
+        slug      = slugify(get_str(f.get('Slug')) or col_name)
+        hero_imgs = f.get('Hero Image', [])
+        hero_url  = hero_imgs[0].get('url') if hero_imgs else None
+        wf_des_id = designer_wf_map.get(designer.lower())
 
         field_data = {
             'name':                   col_name,
