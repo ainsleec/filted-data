@@ -31,7 +31,15 @@ TITLE_EXCLUSIONS = [
     "pattern", "sewing pattern", "fabric", "material",
     "hanger", "bag", "shoes", "boots", "heels", "sandals",
     "sunglasses", "jewellery", "jewelry", "necklace", "ring", "earring",
-    "belt", "scarf", "hat", "cap", "beanie", "perfume", "fragrance"
+    "belt", "scarf", "hat", "cap", "beanie", "perfume", "fragrance",
+    "damaged", "repair", "faulty", "bundle", "retro", "inspired", "vintage",
+    " mens"
+]
+
+# ── Condition filtering ───────────────────────────────────────────────────────
+EXCLUDED_CONDITIONS = [
+    "Acceptable",
+    "For parts or not working"
 ]
 
 HEADERS_AT = {
@@ -132,6 +140,8 @@ def add_sightings(new_items):
                 fields["Listed Price"] = item["price"]
             if item.get("image_url"):
                 fields["eBay Image"] = [{"url": item["image_url"]}]
+            if item.get("condition"):
+                fields["Condition"] = item["condition"]
             records.append({"fields": fields})
 
         resp = requests.post(url_at, headers=HEADERS_AT, json={"records": records})
@@ -192,6 +202,11 @@ def is_excluded(title):
     return any(excl in t for excl in TITLE_EXCLUSIONS)
 
 
+def is_excluded_condition(condition):
+    """Return True if condition is below acceptable threshold."""
+    return condition in EXCLUDED_CONDITIONS
+
+
 def parse_item(raw, designer_name):
     """Extract clean fields from a Browse API item summary dict."""
     # Browse API returns v1|ITEMID|0 — extract numeric ID
@@ -205,6 +220,7 @@ def parse_item(raw, designer_name):
     seller    = raw.get("seller", {}).get("username", "")
     price_val = raw.get("price", {}).get("value")
     date_str  = raw.get("itemCreationDate", "")
+    condition = raw.get("condition", "")
 
     try:
         price = float(price_val) if price_val else None
@@ -227,6 +243,7 @@ def parse_item(raw, designer_name):
         "date_listed": date_listed,
         "seller":      seller,
         "designer":    designer_name,
+        "condition":   condition,
     }
 
 
@@ -251,11 +268,12 @@ def main():
     existing_ids = fetch_existing_item_ids()
     print(f"   {len(existing_ids)} existing sightings\n")
 
-    all_new        = []
-    total_found    = 0
-    total_old      = 0
-    total_excluded = 0
-    total_dupes    = 0
+    all_new            = []
+    total_found        = 0
+    total_old          = 0
+    total_excluded     = 0
+    total_dupes        = 0
+    total_bad_condition = 0
 
     print(f"🔍 Searching eBay AU (last {LOOKBACK_HOURS}hrs)...")
     for designer in designers:
@@ -276,6 +294,10 @@ def main():
                 total_excluded += 1
                 continue
 
+            if is_excluded_condition(item["condition"]):
+                total_bad_condition += 1
+                continue
+
             if item["item_id"] in existing_ids:
                 total_dupes += 1
                 continue
@@ -290,7 +312,7 @@ def main():
             print(f"   {designer}: no results")
         time.sleep(0.5)
 
-    print(f"\n   Total found: {total_found} | Too old: {total_old} | Excluded: {total_excluded} | Dupes: {total_dupes} | New: {len(all_new)}")
+    print(f"\n   Total found: {total_found} | Too old: {total_old} | Excluded: {total_excluded} | Bad condition: {total_bad_condition} | Dupes: {total_dupes} | New: {len(all_new)}")
 
     if all_new:
         print(f"\n📝 Adding {len(all_new)} new sightings to Airtable (unmatched)...")
