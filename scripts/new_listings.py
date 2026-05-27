@@ -39,6 +39,7 @@ TITLE_EXCLUSIONS = [
 # ── Condition filtering ───────────────────────────────────────────────────────
 EXCLUDED_CONDITIONS = [
     "Acceptable",
+    "Fair",
     "For parts or not working"
 ]
 
