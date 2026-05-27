@@ -169,7 +169,7 @@ def search_ebay(keyword, ebay_headers, since_hours):
             params={
                 "q":            keyword,
                 "category_ids": EBAY_WOMENS_CAT,
-                "filter":       "itemLocationCountry:AU,price:[20..],priceCurrency:AUD",
+                "filter":       "itemLocationCountry:AU,price:[5..],priceCurrency:AUD",
                 "sort":         "newlyListed",
                 "limit":        str(MAX_PER_DESIGNER),
             },
