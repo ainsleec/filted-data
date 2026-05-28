@@ -209,7 +209,6 @@ def main():
     print(f'  {len(designer_wf_map)} designers found')
 
     # 2. Load ALL published collections from Airtable
-    # Designer Name is a lookup field so we filter in Python instead
     print('\nLoading Airtable collections...')
     all_collections = at_get_all(
         'Collections',
@@ -222,7 +221,7 @@ def main():
     )
     print(f'  {len(all_collections)} total published collections found')
 
-    # Filter to target designers in Python (avoids lookup field formula issues)
+    # Filter to target designers in Python
     target_lower = [d.lower() for d in TARGET_DESIGNERS]
     collections  = [
         c for c in all_collections
@@ -288,8 +287,8 @@ def main():
         if hero_url:
             field_data['hero-image'] = {'url': hero_url, 'alt': f'{designer} {col_name}'}
         release_date = get_str(f.get('Release Date'))
-if release_date:
-    field_data['released'] = release_date
+        if release_date:
+            field_data['released'] = release_date
 
         try:
             if wf_item_id:
