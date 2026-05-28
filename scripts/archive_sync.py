@@ -18,7 +18,7 @@ from datetime import datetime
 
 # ── Config ────────────────────────────────────────────────────────────────────
 AIRTABLE_TOKEN       = os.environ['AIRTABLE_API_KEY']
-AIRTABLE_BASE_ID     = os.environ['AIRTABLE_BASE_ID']
+AIRTABLE_BASE_ID     = os.environ['AIRTABLE_BASE']
 WEBFLOW_TOKEN        = os.environ['WEBFLOW_API_TOKEN']
 
 AIRTABLE_BASE        = f'https://api.airtable.com/v0/{AIRTABLE_BASE_ID}'
