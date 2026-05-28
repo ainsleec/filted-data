@@ -33,7 +33,7 @@ TITLE_EXCLUSIONS = [
     "sunglasses", "jewellery", "jewelry", "necklace", "ring", "earring",
     "belt", "scarf", "hat", "cap", "beanie", "perfume", "fragrance",
     "damaged", "repair", "faulty", "bundle", "retro", "inspired", "vintage",
-    " mens"
+    " mens", "smart", "damaged"
 ]
 
 # ── Condition filtering ───────────────────────────────────────────────────────
