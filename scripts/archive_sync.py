@@ -21,7 +21,7 @@ AIRTABLE_TOKEN       = os.environ['AIRTABLE_API_KEY']
 AIRTABLE_BASE_ID     = os.environ['AIRTABLE_BASE']
 WEBFLOW_TOKEN        = os.environ['WEBFLOW_API_TOKEN']
 
-AIRTABLE_BASE        = f'https://api.airtable.com/v0/{AIRTABLE_BASE_ID}'
+AIRTABLE_BASE        = f'https://api.airtable.com/v0/{AIRTABLE_BASE}'
 WEBFLOW_BASE         = 'https://api.webflow.com/v2'
 
 WEBFLOW_CAMPAIGNS_ID = '68944133543f0cbb26b4aeb9'
