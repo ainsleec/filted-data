@@ -23,7 +23,7 @@ from pyairtable import Api
 
 # ── Config ────────────────────────────────────────────────────────────────────
 AIRTABLE_API_KEY        = os.environ["AIRTABLE_API_KEY"]
-AIRTABLE_BASE           = "appUk1ThnHvWwFDHG"
+AIRTABLE_BASE_ID        = "appUk1ThnHvWwFDHG"
 DESIGNERS_TABLE_ID      = "tbltYGtfVV574EOcw"
 CAMPAIGNS_TABLE_ID      = "tblyVgpD1SSCrRSgQ"
 GARMENTS_TABLE_ID       = "tblmqjU4WqgCzP7cR"
@@ -73,7 +73,7 @@ def get_str(value, default=""):
 # ── Airtable helpers ──────────────────────────────────────────────────────────
 def get_all_airtable_records(table_id: str, filter_formula: str = None, fields: list = None) -> list:
     api    = Api(AIRTABLE_API_KEY)
-    table  = api.table(AIRTABLE_BASE_ID, table_id)
+    table  = api.table(AIRTABLE_BASE, table_id)
     kwargs = {}
     if filter_formula:
         kwargs["formula"] = filter_formula
@@ -84,7 +84,7 @@ def get_all_airtable_records(table_id: str, filter_formula: str = None, fields: 
 
 def write_webflow_id_to_airtable(table_id: str, record_id: str, webflow_id: str):
     api   = Api(AIRTABLE_API_KEY)
-    table = api.table(AIRTABLE_BASE_ID, table_id)
+    table = api.table(AIRTABLE_BASE, table_id)
     table.update(record_id, {WEBFLOW_ID_FIELD: webflow_id})
 
 
