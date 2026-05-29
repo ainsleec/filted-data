@@ -24,4 +24,4 @@ jobs:
           AIRTABLE_BASE:     ${{ secrets.AIRTABLE_BASE }}
           WEBFLOW_API_TOKEN: ${{ secrets.WEBFLOW_API_TOKEN }}
           GH_PAT:            ${{ secrets.GH_PAT }}
-        run: python scripts/archive_sync.py
+        run: python scripts/sync.py
