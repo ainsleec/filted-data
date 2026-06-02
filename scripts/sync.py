@@ -159,7 +159,6 @@ def build_campaign_fields(at_fields: dict, designer_webflow_id: str | None) -> d
         "name":        name,
         "slug":        slugify(get_str(at_fields.get("Slug")) or name),
         "season-code": get_str(at_fields.get("Season Code")),
-        "released-2":  get_str(at_fields.get("Released")) or None,
     }
     if designer_webflow_id:
         fields["designer"] = designer_webflow_id
