@@ -342,7 +342,7 @@ def main():
 
     all_campaigns = get_all_airtable_records(
         CAMPAIGNS_TABLE_ID,
-        filter_formula="{Published}=1",
+        filter_formula="{Published}=TRUE()",
         fields=[
             "Collection Name", "Designer Name", "Designer", "Season Code",
             "Hero Image", "Slug", "Webflow Item ID",
