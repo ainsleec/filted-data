@@ -286,10 +286,7 @@ def main():
             field_data['designer'] = wf_des_id
         if hero_url:
             field_data['hero-image'] = {'url': hero_url, 'alt': f'{designer} {col_name}'}
-        release_date = get_str(f.get('Release Date'))
-        if release_date:
-            field_data['released'] = release_date
-
+        
         try:
             if wf_item_id:
                 wf_update_item(WEBFLOW_CAMPAIGNS_ID, wf_item_id, field_data)
