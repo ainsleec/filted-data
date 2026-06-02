@@ -215,7 +215,7 @@ def main():
         filter_formula='{Published}=1',
         fields=[
             'Collection Name', 'Designer Name', 'Season Code',
-            'Release Date', 'Hero Image', 'Slug', 'Webflow Item ID',
+            'Hero Image', 'Slug', 'Webflow Item ID',
         ],
         sort=[{'field': 'Designer Name'}, {'field': 'Collection Name'}],
     )
