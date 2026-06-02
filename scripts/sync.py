@@ -230,15 +230,6 @@ def build_campaign_fields(
     if hero:
         fields["hero-image"] = {"url": hero[0].get("url"), "alt": name}
 
-    # Highlight photos (multi-image)
-    highlights = at_fields.get("Highlight Photos", [])
-    if highlights:
-        fields["highlight-photos"] = [
-            {"url": img.get("url"), "alt": name}
-            for img in highlights
-            if img.get("url")
-        ]
-
     return fields
 
 
@@ -354,7 +345,7 @@ def main():
         filter_formula="{Published}=1",
         fields=[
             "Collection Name", "Designer Name", "Designer", "Season Code",
-            "Hero Image", "Highlight Photos", "Slug", "Webflow Item ID",
+            "Hero Image", "Slug", "Webflow Item ID",
         ],
     )
 
