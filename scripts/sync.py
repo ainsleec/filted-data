@@ -14,7 +14,6 @@ Sync order:
 
 Required GitHub Secrets:
   AIRTABLE_API_KEY   — Airtable personal access token
-  AIRTABLE_BASE_ID   — Airtable base ID (used as AIRTABLE_BASE env var)
   WEBFLOW_API_TOKEN  — Webflow API v2 token
   GH_PAT             — GitHub personal access token
 """
@@ -225,7 +224,6 @@ def build_campaign_fields(
     if designer_webflow_id:
         fields["designer"] = designer_webflow_id
 
-    # Hero image (single)
     hero = at_fields.get("Hero Image", [])
     if hero:
         fields["hero-image"] = {"url": hero[0].get("url"), "alt": name}
@@ -238,6 +236,16 @@ def build_garment_fields(
     campaign_webflow_id: str | None,
     designer_webflow_id: str | None,
 ) -> dict:
+    # Webflow Garments collection — verified field slugs:
+    # style-id       → Product Code
+    # product-colour → Product Colour
+    # category-3     → Category
+    # rrp            → RRP
+    # campaign-2     → Campaign (Reference)
+    # designers      → Designer (Reference)
+    # main-photo     → Image 1
+    # image-2        → Image 2
+
     name = get_str(at_fields.get("Garment Name"))
     if not name:
         return {}
@@ -246,20 +254,20 @@ def build_garment_fields(
     fields = {
         "name":           name,
         "slug":           slugify(slug_base),
-        "product-code":   get_str(at_fields.get("Product Code")),
+        "style-id":       get_str(at_fields.get("Product Code")),
         "product-colour": get_str(at_fields.get("Product Colour")),
-        "category":       get_str(at_fields.get("Category")),
+        "category-3":     get_str(at_fields.get("Category")),
         "rrp":            at_fields.get("RRP") or 0,
     }
 
     if campaign_webflow_id:
-        fields["campaign"] = campaign_webflow_id
+        fields["campaign-2"] = campaign_webflow_id
     if designer_webflow_id:
-        fields["designer"] = designer_webflow_id
+        fields["designers"] = designer_webflow_id
 
     img1 = at_fields.get("Image 1", [])
     if img1:
-        fields["image-1"] = {"url": img1[0].get("url"), "alt": name}
+        fields["main-photo"] = {"url": img1[0].get("url"), "alt": name}
 
     img2 = at_fields.get("Image 2", [])
     if img2:
@@ -326,7 +334,6 @@ def main():
         for r in designer_records
         if r["fields"].get(WEBFLOW_ID_FIELD)
     }
-    # Also build name → webflow ID map for campaign sync
     designer_name_to_wf = {}
     for r in designer_records:
         name  = get_str(r["fields"].get("Designer Name"))
@@ -368,7 +375,6 @@ def main():
         col_name    = get_str(at_fields.get("Collection Name"))
         designer    = get_str(at_fields.get("Designer Name"))
 
-        # Designer Webflow ID — try linked record first, fall back to name map
         linked_designers   = at_fields.get("Designer", [])
         linked_designer_id = linked_designers[0] if linked_designers else None
         designer_wf_id     = (
@@ -379,7 +385,6 @@ def main():
 
         print(f"\n  {designer} — {col_name}")
 
-        # Fetch garments for editorial content + meta description
         garments = []
         if col_name:
             try:
