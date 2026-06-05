@@ -7,7 +7,7 @@ Sync order:
   1. Build Designer lookup
   2. Sync Campaigns         (Airtable Collections → Webflow Campaigns)
   3. Identify active garments
-  4. Sync Garments          (verified active sightings only)
+  4. Sync Garments          (verified active sightings + published campaigns only)
   5. Delete garments no longer with active sightings
   6. Sync Sightings         (Verified Active → create/update; Expired/Removed → delete)
   7. Save last sync timestamp to GitHub
@@ -217,6 +217,7 @@ def build_campaign_fields(
         "slug":                   slugify(get_str(at_fields.get("Slug")) or name),
         "season-code":            get_str(at_fields.get("Season Code")),
         "airtable-collection-id": airtable_record_id,
+        "designer-name":          designer_name,
         "editorial-content":      generate_garment_html(garments, designer_name, name),
         "meta-description":       generate_meta_description(garments, designer_name, name),
     }
@@ -250,10 +251,15 @@ def build_garment_fields(
     if not name:
         return {}
 
-    slug_base = get_str(at_fields.get("Webflow Slug")) or name
+    slug_base    = get_str(at_fields.get("Webflow Slug")) or name
+    product_code = get_str(at_fields.get("Product Code")).lower()
+    slug         = slugify(slug_base)
+    if product_code:
+        slug = f"{slug}-{slugify(product_code)}"
+
     fields = {
         "name":           name,
-        "slug":           slugify(slug_base),
+        "slug":           slug[:80],
         "style-id":       get_str(at_fields.get("Product Code")),
         "product-colour": get_str(at_fields.get("Product Colour")),
         "category-3":     get_str(at_fields.get("Category")),
@@ -423,6 +429,9 @@ def main():
 
     print(f"\n  Campaigns: {created} created | {updated} updated | {skipped} skipped | {errors} errors")
 
+    # Build set of published campaign Airtable IDs (only ones that made it into Webflow)
+    published_campaign_ids = set(campaign_lookup.keys())
+
     # ── Step 3: Identify active garments ─────────────────────────────────────
     print("\n" + "=" * 64)
     print("  Loading all sightings...")
@@ -450,11 +459,18 @@ def main():
     print("=" * 64)
 
     all_garments = get_all_airtable_records(GARMENTS_TABLE_ID)
+
+    # Only sync garments whose parent campaign is published
     priority_garments = [
         g for g in all_garments
-        if g["id"] in active_garment_ids and g["fields"].get("Image 1")
+        if g["id"] in active_garment_ids
+        and g["fields"].get("Image 1")
+        and any(
+            c in published_campaign_ids
+            for c in (g["fields"].get("Collection") or g["fields"].get("Campaign") or [])
+        )
     ]
-    print(f"  {len(priority_garments)} garments with verified active sightings + image")
+    print(f"  {len(priority_garments)} garments with verified active sightings + image + published campaign")
 
     garment_lookup = {}
     for g in all_garments:
