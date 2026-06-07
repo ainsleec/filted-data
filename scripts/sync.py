@@ -220,6 +220,7 @@ def build_campaign_fields(
         "designer-name":          designer_name,
         "editorial-content":      generate_garment_html(garments, designer_name, name),
         "meta-description":       generate_meta_description(garments, designer_name, name),
+        "designer-name":          designer_name,
     }
 
     if designer_webflow_id:
