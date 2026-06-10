@@ -22,7 +22,7 @@ EBAY_CLIENT_SECRET  = os.environ["EBAY_CLIENT_SECRET"]
 
 # ── eBay strict settings ──────────────────────────────────────────────────────
 EBAY_WOMENS_CAT     = "15724"    # eBay AU: Women's Clothing — no other categories
-LOOKBACK_HOURS      = 14         # Runs twice daily, 14hr window with overlap
+LOOKBACK_HOURS      = 72         # Runs twice daily, 14hr window with overlap
 MAX_PER_DESIGNER    = 100        # Cap per designer per run
 
 TITLE_EXCLUSIONS = [
