@@ -1,44 +1,129 @@
 #!/usr/bin/env python3
 """
-Filted — eBay Expiry Checker
+Filted — eBay Expiry Checker + Supabase Price Tracker
 Runs once daily on PythonAnywhere (2am AEST).
 
 Checks all Active sightings in Airtable against eBay Browse API.
 Updates status to Expired or Sold, fetches final sold price where available.
 
-Fixes vs original Colab cell:
-  - get_sold_price() implemented (was referenced but undefined)
-  - Bug fix: sold_updates used wrong key names (price_sold vs sold_price)
-  - Token auto-refresh using client credentials (no manual token copy needed)
+NEW: Also writes price observations to Supabase listings table.
+  - Detects price changes and appends to price_history JSONB
+  - Stamps ended_at and ended_reason when a listing expires or sells
 """
 
-import os, re, requests, time, base64
+import os, re, requests, time, base64, json
 from datetime import datetime, timezone, timedelta
 
 # ── Config ────────────────────────────────────────────────────────────────────
-AIRTABLE_TOKEN        = os.environ["AIRTABLE_TOKEN"]
-AIRTABLE_BASE         = os.environ["AIRTABLE_BASE"]
-RESALE_SIGHTINGS_TABLE= os.environ["RESALE_SIGHTINGS_TABLE"]
+AIRTABLE_TOKEN         = os.environ["AIRTABLE_TOKEN"]
+AIRTABLE_BASE          = os.environ["AIRTABLE_BASE"]
+RESALE_SIGHTINGS_TABLE = os.environ["RESALE_SIGHTINGS_TABLE"]
 
-EBAY_CLIENT_ID        = os.environ["EBAY_CLIENT_ID"]     # Same as App ID
-EBAY_CLIENT_SECRET    = os.environ["EBAY_CLIENT_SECRET"]
+EBAY_CLIENT_ID     = os.environ["EBAY_CLIENT_ID"]
+EBAY_CLIENT_SECRET = os.environ["EBAY_CLIENT_SECRET"]
 
-MIN_AGE_DAYS          = 1      # Don't check listings newer than this
-RECHECK_DAYS          = 1      # Recheck listings not checked within this many days
-BATCH_LIMIT           = 2000   # Max sightings to process per run
+# NEW: Supabase credentials
+SUPABASE_URL         = os.environ.get("SUPABASE_URL", "")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+
+MIN_AGE_DAYS  = 1
+RECHECK_DAYS  = 1
+BATCH_LIMIT   = 2000
 
 HEADERS_AT = {
     "Authorization": f"Bearer {AIRTABLE_TOKEN}",
     "Content-Type":  "application/json"
 }
 
+
+# ── NEW: Supabase helpers ─────────────────────────────────────────────────────
+def get_supabase_headers():
+    return {
+        "apikey":        SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "Content-Type":  "application/json",
+        "Prefer":        "return=minimal",
+    }
+
+
+def supabase_get(path, params=None):
+    """GET request to Supabase REST API."""
+    resp = requests.get(
+        f"{SUPABASE_URL}/rest/v1/{path}",
+        headers=get_supabase_headers(),
+        params=params,
+        timeout=15
+    )
+    return resp.json() if resp.ok else []
+
+
+def supabase_patch(path, match_params, data):
+    """PATCH (update) matching rows in Supabase."""
+    resp = requests.patch(
+        f"{SUPABASE_URL}/rest/v1/{path}",
+        headers=get_supabase_headers(),
+        params=match_params,
+        json=data,
+        timeout=15
+    )
+    return resp.ok
+
+
+def load_supabase_active_listings():
+    """
+    Fetch all active (not ended) listings from Supabase.
+    Returns dict keyed by ebay_item_id for fast lookup.
+    """
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        print("   ⚠️  Supabase not configured — skipping price observations")
+        return {}
+
+    rows = supabase_get("listings", params={
+        "select":   "id,ebay_item_id,price_history",
+        "ended_at": "is.null",
+    })
+    return {r["ebay_item_id"]: r for r in rows if r.get("ebay_item_id")}
+
+
+def append_price_observation(ebay_item_id, new_price, date_str, sb_listings):
+    """
+    Append a price observation to a listing's price_history if price changed.
+    Only writes if price differs from the last recorded entry.
+    Returns True if an update was made.
+    """
+    listing = sb_listings.get(ebay_item_id)
+    if not listing or new_price is None:
+        return False
+
+    history   = listing.get("price_history") or []
+    last_price = history[-1]["price"] if history else None
+
+    if new_price == last_price:
+        return False  # No change, skip
+
+    history.append({"date": date_str, "price": new_price})
+    ok = supabase_patch(
+        "listings",
+        {"ebay_item_id": f"eq.{ebay_item_id}"},
+        {"price_history": history}
+    )
+    return ok
+
+
+def mark_listing_ended(ebay_item_id, reason):
+    """Stamp ended_at and ended_reason on a Supabase listing."""
+    return supabase_patch(
+        "listings",
+        {"ebay_item_id": f"eq.{ebay_item_id}"},
+        {
+            "ended_at":     datetime.now(timezone.utc).isoformat(),
+            "ended_reason": reason,
+        }
+    )
+
+
 # ── eBay OAuth token (auto-refresh) ───────────────────────────────────────────
 def get_ebay_token():
-    """
-    Fetch a fresh eBay OAuth token via client credentials flow.
-    Valid for ~2 hours — more than enough for one run.
-    No more copying tokens manually.
-    """
     credentials = base64.b64encode(
         f"{EBAY_CLIENT_ID}:{EBAY_CLIENT_SECRET}".encode()
     ).decode()
@@ -61,12 +146,6 @@ def get_ebay_token():
 
 # ── eBay status checks ────────────────────────────────────────────────────────
 def check_listing_status(item_id, ebay_headers):
-    """
-    Check eBay listing status via Browse API.
-    Returns (status, listed_price):
-      status      — "Active", "Sold", or "Expired"
-      listed_price — float or None
-    """
     try:
         resp = requests.get(
             f"https://api.ebay.com/buy/browse/v1/item/v1|{item_id}|0",
@@ -79,7 +158,6 @@ def check_listing_status(item_id, ebay_headers):
             price_str = data.get("price", {}).get("value")
             price_val = float(price_str) if price_str else None
 
-            # Check if listing has passed its end date
             end_date_raw = data.get("itemEndDate", "")
             if end_date_raw:
                 end_dt = datetime.fromisoformat(end_date_raw.replace("Z", "+00:00"))
@@ -104,22 +182,17 @@ def check_listing_status(item_id, ebay_headers):
             return "Expired", None
     except Exception:
         pass
-    return "Active", None   # Default: assume active on error, check again tomorrow
+    return "Active", None
 
 
 def get_sold_price(item_id, ebay_app_id):
-    """
-    Fetch final sold price via eBay Shopping API GetSingleItem.
-    Returns (price_float_or_None, date_str_or_None).
-    Only works within ~90 days of sale — returns (None, None) after that.
-    """
     try:
         resp = requests.get(
             "https://open.api.ebay.com/shopping",
             params={
                 "callname":         "GetSingleItem",
                 "appid":            ebay_app_id,
-                "siteid":           "15",           # eBay AU
+                "siteid":           "15",
                 "ItemID":           item_id,
                 "responseencoding": "JSON",
                 "version":          "967",
@@ -128,15 +201,11 @@ def get_sold_price(item_id, ebay_app_id):
         )
         if not resp.ok:
             return None, None
-
-        data = resp.json()
-        item = data.get("Item", {})
-
-        # SellingStatus contains final price for ended listings
+        data    = resp.json()
+        item    = data.get("Item", {})
         selling = item.get("SellingStatus", {})
         price   = selling.get("CurrentPrice", {}).get("Value")
         end_time= item.get("EndTime", "")
-
         sold_price = float(price) if price else None
         sold_date  = None
         if end_time:
@@ -146,7 +215,6 @@ def get_sold_price(item_id, ebay_app_id):
                 ).strftime("%Y-%m-%d")
             except Exception:
                 pass
-
         return sold_price, sold_date
     except Exception:
         return None, None
@@ -154,7 +222,6 @@ def get_sold_price(item_id, ebay_app_id):
 
 # ── Airtable helpers ──────────────────────────────────────────────────────────
 def load_active_sightings():
-    """Load Active sightings that are due for rechecking."""
     recheck_cutoff = (
         datetime.now(timezone.utc) - timedelta(days=RECHECK_DAYS)
     ).strftime("%Y-%m-%dT%H:%M:%S.000Z")
@@ -183,11 +250,9 @@ def load_active_sightings():
 
 
 def push_updates(ended, sold_with_price, still_active_ids):
-    """Apply all status updates to Airtable in batches of 10."""
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     url_at  = f"https://api.airtable.com/v0/{AIRTABLE_BASE}/{RESALE_SIGHTINGS_TABLE}"
 
-    # Build sold update records — fixed key names (was price_sold/date_sold, now sold_price/sold_date)
     sold_updates = []
     for r in sold_with_price:
         fields = {"Status": "Sold", "Last Checked": now_iso}
@@ -210,17 +275,16 @@ def push_updates(ended, sold_with_price, still_active_ids):
             print(f"  ⚠️  Batch {i // 10 + 1} error: {resp.text[:200]}")
             errors += 1
         time.sleep(0.2)
-
     return len(updates), errors
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     run_start = datetime.now(timezone.utc)
-    print(f"🔄 Filted — eBay Expiry Checker")
+    today     = run_start.strftime("%Y-%m-%d")  # NEW: for price observations
+    print(f"🔄 Filted — eBay Expiry Checker + Price Tracker")
     print(f"   {run_start.strftime('%Y-%m-%d %H:%M UTC')}\n")
 
-    # Get a fresh eBay token — no more manual copy-paste
     print("🔑 Fetching eBay OAuth token...")
     ebay_token = get_ebay_token()
     ebay_headers = {
@@ -228,12 +292,15 @@ def main():
         "X-EBAY-C-MARKETPLACE-ID": "EBAY_AU"
     }
 
-    # ── 1. Load active sightings ──────────────────────────────────────────────
-    print("\n📦 Loading active sightings...")
+    # NEW: Load active listings from Supabase for price comparison
+    print("\n📊 Loading active listings from Supabase...")
+    sb_listings = load_supabase_active_listings()
+    print(f"   {len(sb_listings)} active listings loaded for price tracking")
+
+    print("\n📦 Loading active sightings from Airtable...")
     all_sightings = load_active_sightings()
     print(f"   {len(all_sightings)} sightings due for checking")
 
-    # ── 2. Filter and cap ─────────────────────────────────────────────────────
     fresh_cutoff = datetime.now(timezone.utc) - timedelta(days=MIN_AGE_DAYS)
     to_check, skipped_fresh, skipped_no_id = [], 0, 0
 
@@ -243,7 +310,6 @@ def main():
         f   = rec["fields"]
         url = f.get("Listing URL", "")
 
-        # Prefer stored eBay Item ID; fall back to URL parse
         item_id = str(f.get("eBay Item ID") or "").strip()
         if not item_id:
             m = re.search(r"/itm/(\d+)", url)
@@ -265,31 +331,44 @@ def main():
 
     print(f"   {len(to_check)} to check | {skipped_fresh} too fresh | {skipped_no_id} no ID/URL\n")
 
-    # ── 3. Check eBay status ──────────────────────────────────────────────────
     print("🔍 Checking eBay listing status...")
-
-    ended        = []   # list of {id, item_id}
-    sold         = []   # list of {id, item_id}
-    still_active = []   # list of record IDs
+    ended        = []
+    sold         = []
+    still_active = []
     errors       = []
+    price_updates = 0  # NEW: track how many price changes detected
 
     for i, rec in enumerate(to_check):
-        status, _ = check_listing_status(rec["item_id"], ebay_headers)
+        status, current_price = check_listing_status(rec["item_id"], ebay_headers)
+
         if status == "Expired":
             ended.append(rec)
+            # NEW: stamp ended in Supabase
+            if rec["item_id"] in sb_listings:
+                mark_listing_ended(rec["item_id"], "expired")
+
         elif status == "Sold":
             sold.append(rec)
+            # NEW: stamp sold in Supabase
+            if rec["item_id"] in sb_listings:
+                mark_listing_ended(rec["item_id"], "sold")
+
         elif status == "Active":
             still_active.append(rec["id"])
+            # NEW: detect and log price change
+            if current_price and append_price_observation(rec["item_id"], current_price, today, sb_listings):
+                price_updates += 1
+
         else:
             errors.append(rec)
+
         time.sleep(0.3)
         if (i + 1) % 100 == 0:
-            print(f"   ... {i + 1}/{len(to_check)} — expired: {len(ended)}, sold: {len(sold)}")
+            print(f"   ... {i + 1}/{len(to_check)} — expired: {len(ended)}, sold: {len(sold)}, price changes: {price_updates}")
 
     print(f"\n   Expired: {len(ended)} | Sold: {len(sold)} | Still active: {len(still_active)} | Errors: {len(errors)}")
+    print(f"   Price changes logged to Supabase: {price_updates}")  # NEW
 
-    # ── 4. Fetch actual sold prices ───────────────────────────────────────────
     sold_with_price = []
     if sold:
         print(f"\n💰 Fetching final sold prices ({len(sold)} items)...")
@@ -298,8 +377,8 @@ def main():
             sold_price, sold_date = get_sold_price(rec["item_id"], EBAY_CLIENT_ID)
             sold_with_price.append({
                 "id":         rec["id"],
-                "sold_price": sold_price,   # Fixed key name (was price_sold)
-                "sold_date":  sold_date,    # Fixed key name (was date_sold)
+                "sold_price": sold_price,
+                "sold_date":  sold_date,
             })
             if sold_price:
                 found += 1
@@ -307,9 +386,8 @@ def main():
             else:
                 missing += 1
             time.sleep(0.25)
-        print(f"\n   Prices found: {found} | Unavailable (>90 days or delisted): {missing}")
+        print(f"\n   Prices found: {found} | Unavailable: {missing}")
 
-    # ── 5. Push updates to Airtable ───────────────────────────────────────────
     print(f"\n📝 Applying updates to Airtable...")
     total_updated, err_count = push_updates(ended, sold_with_price, still_active)
     print(f"   {total_updated} records updated | {err_count} batch errors")
