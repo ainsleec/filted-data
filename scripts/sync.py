@@ -10,14 +10,14 @@ Sync order:
   4. Sync Garments          (verified active sightings only)
   5. Delete garments no longer with active sightings
   6. Sync Sightings         (Verified Active → create/update; Expired/Removed → delete)
-  7. Refresh Supabase image URLs
+  7. Upload images to Supabase Storage (permanent URLs)
   8. Save last sync timestamp to GitHub
 
 Required GitHub Secrets:
-  AIRTABLE_API_KEY   — Airtable personal access token
-  WEBFLOW_API_TOKEN  — Webflow API v2 token
-  GH_PAT             — GitHub personal access token
-  SUPABASE_URL       — Supabase project URL
+  AIRTABLE_API_KEY     — Airtable personal access token
+  WEBFLOW_API_TOKEN    — Webflow API v2 token
+  GH_PAT               — GitHub personal access token
+  SUPABASE_URL         — Supabase project URL
   SUPABASE_SERVICE_KEY — Supabase service role key
 """
 
@@ -171,59 +171,94 @@ def save_last_sync(ts: datetime):
     )
 
 
-# ── Supabase image refresh ────────────────────────────────────────────────────
-def refresh_supabase_images(all_garments: list):
+# ── Supabase image upload ─────────────────────────────────────────────────────
+def upload_images_to_supabase(all_garments: list):
     supabase_url = os.environ.get("SUPABASE_URL")
     supabase_key = os.environ.get("SUPABASE_SERVICE_KEY")
     if not supabase_url or not supabase_key:
-        print("  ⚠️  Supabase credentials not found, skipping image refresh")
+        print("  ⚠️  Supabase credentials not found, skipping image upload")
         return
 
     print("\n" + "=" * 64)
-    print("  Refreshing Supabase image URLs")
+    print("  Uploading images to Supabase Storage")
     print("=" * 64)
 
     headers = {
         "apikey": supabase_key,
         "Authorization": f"Bearer {supabase_key}",
-        "Content-Type": "application/json",
-        "Prefer": "return=minimal",
     }
 
-    def extract_url(img):
-        return img.get("url") if isinstance(img, dict) else img
+    uploaded = skipped = errors = 0
 
-    updated = skipped = errors = 0
     for record in all_garments:
         airtable_id = record["id"]
-        at_fields = record.get("fields", {})
+        at_fields   = record.get("fields", {})
 
         img1 = at_fields.get("Image 1", [])
         if not img1:
             skipped += 1
             continue
 
-        image_url = extract_url(img1[0])
-        all_images = [
-            extract_url(img)
-            for field in ["Image 1", "Image 2", "Image 3", "Image 4", "Image 5", "Image 6", "Image 7"]
-            for img in at_fields.get(field, [])
-            if img
-        ]
-        all_images = [url for url in all_images if url]
+        image_url = img1[0].get("url") if isinstance(img1[0], dict) else img1[0]
+        if not image_url:
+            skipped += 1
+            continue
 
-        res = requests.patch(
-            f"{supabase_url}/rest/v1/garments?airtable_id=eq.{airtable_id}",
-            headers=headers,
-            json={"image_url": image_url, "images": all_images},
+        path = f"{airtable_id}.jpg"
+
+        # Check if already in Supabase garments table as permanent URL
+        check = requests.get(
+            f"{supabase_url}/rest/v1/garments?airtable_id=eq.{airtable_id}&select=image_url",
+            headers={**headers, "Content-Type": "application/json"},
         )
-        if res.status_code in (200, 204):
-            updated += 1
-        else:
-            errors += 1
-        time.sleep(0.02)
+        if check.status_code == 200:
+            rows = check.json()
+            if rows and rows[0].get("image_url", "").startswith(f"{supabase_url}/storage"):
+                skipped += 1
+                continue
 
-    print(f"  Images refreshed: {updated} updated | {skipped} skipped (no image) | {errors} errors")
+        # Download fresh image from Airtable
+        try:
+            img_res = requests.get(image_url, timeout=15)
+            if img_res.status_code != 200:
+                errors += 1
+                continue
+        except Exception as e:
+            print(f"    ⚠️  Download failed {airtable_id}: {e}")
+            errors += 1
+            continue
+
+        # Upload to Supabase Storage
+        upload = requests.post(
+            f"{supabase_url}/storage/v1/object/garment-images/{path}",
+            headers={
+                **headers,
+                "Content-Type": "image/jpeg",
+                "x-upsert": "true",
+            },
+            data=img_res.content,
+        )
+
+        if upload.status_code in (200, 201):
+            permanent_url = f"{supabase_url}/storage/v1/object/public/garment-images/{path}"
+            # Update garment with permanent URL
+            requests.patch(
+                f"{supabase_url}/rest/v1/garments?airtable_id=eq.{airtable_id}",
+                headers={
+                    **headers,
+                    "Content-Type": "application/json",
+                    "Prefer": "return=minimal",
+                },
+                json={"image_url": permanent_url},
+            )
+            uploaded += 1
+        else:
+            print(f"    ⚠️  Upload failed {airtable_id}: {upload.status_code} {upload.text[:100]}")
+            errors += 1
+
+        time.sleep(0.05)
+
+    print(f"  Images: {uploaded} uploaded | {skipped} skipped (already permanent) | {errors} errors")
 
 
 # ── Content generation ────────────────────────────────────────────────────────
@@ -624,8 +659,8 @@ def main():
         time.sleep(0.2)
     print(f"  Sightings: {created} created | {updated} updated | {skipped} skipped | {errors} errors")
 
-    # ── Step 7: Refresh Supabase image URLs ───────────────────────────────────
-    refresh_supabase_images(all_garments)
+    # ── Step 7: Upload images to Supabase Storage ─────────────────────────────
+    upload_images_to_supabase(all_garments)
 
     # ── Step 8: Save timestamp ────────────────────────────────────────────────
     save_last_sync(sync_started)
