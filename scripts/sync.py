@@ -213,7 +213,7 @@ def upload_images_to_supabase(all_garments: list):
         )
         if check.status_code == 200:
             rows = check.json()
-            if rows and rows[0].get("image_url", "").startswith(f"{supabase_url}/storage"):
+            if rows and (rows[0].get("image_url") or "").startswith(f"{supabase_url}/storage"):
                 skipped += 1
                 continue
 
