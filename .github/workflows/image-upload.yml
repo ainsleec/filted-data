@@ -14,7 +14,7 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install requests pyairtable
-      - run: python image_upload.py
+      - run: python scripts/image_upload.py
         env:
           AIRTABLE_API_KEY: ${{ secrets.AIRTABLE_API_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
