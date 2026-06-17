@@ -44,7 +44,7 @@ for record in all_garments:
     )
     if check.status_code == 200:
         rows = check.json()
-        if rows and rows[0].get("image_url", "").startswith(f"{SUPABASE_URL}/storage"):
+        if rows and (rows[0].get("image_url") or "").startswith(f"{SUPABASE_URL}/storage"):
             skipped += 1
             continue
 
