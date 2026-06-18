@@ -15,6 +15,24 @@ headers = {
     "Authorization": f"Bearer {SUPABASE_KEY}",
 }
 
+# Fetch all already-permanent airtable_ids in one batch
+print("Fetching already-uploaded garments from Supabase...")
+already_done = set()
+offset = 0
+while True:
+    res = requests.get(
+        f"{SUPABASE_URL}/rest/v1/garments?select=airtable_id,image_url&limit=1000&offset={offset}",
+        headers={**headers, "Content-Type": "application/json"},
+    )
+    rows = res.json()
+    for r in rows:
+        if (r.get("image_url") or "").startswith(f"{SUPABASE_URL}/storage"):
+            already_done.add(r["airtable_id"])
+    if len(rows) < 1000:
+        break
+    offset += 1000
+print(f"  {len(already_done)} already uploaded — will skip these")
+
 print("Fetching all garments from Airtable...")
 api = Api(AIRTABLE_API_KEY)
 table = api.table(AIRTABLE_BASE_ID, GARMENTS_TABLE_ID)
@@ -25,6 +43,11 @@ uploaded = skipped = errors = 0
 
 for record in all_garments:
     airtable_id = record["id"]
+
+    if airtable_id in already_done:
+        skipped += 1
+        continue
+
     img1 = record["fields"].get("Image 1", [])
     if not img1:
         skipped += 1
@@ -37,28 +60,15 @@ for record in all_garments:
 
     path = f"{airtable_id}.jpg"
 
-    # Skip if already permanent
-    check = requests.get(
-        f"{SUPABASE_URL}/rest/v1/garments?airtable_id=eq.{airtable_id}&select=image_url",
-        headers={**headers, "Content-Type": "application/json"},
-    )
-    if check.status_code == 200:
-        rows = check.json()
-        if rows and (rows[0].get("image_url") or "").startswith(f"{SUPABASE_URL}/storage"):
-            skipped += 1
-            continue
-
-    # Download from Airtable (fresh during this run)
     try:
         img_res = requests.get(image_url, timeout=15)
         if img_res.status_code != 200:
             errors += 1
             continue
-    except Exception as e:
+    except Exception:
         errors += 1
         continue
 
-    # Upload to Supabase Storage
     upload = requests.post(
         f"{SUPABASE_URL}/storage/v1/object/{BUCKET}/{path}",
         headers={**headers, "Content-Type": "image/jpeg", "x-upsert": "true"},
