@@ -1,28 +1,21 @@
 name: eBay Expiry Checker
-
 on:
   schedule:
-    - cron: '0 14 * * *'   # 12am AEST
-    - cron: '0 2 * * *'    # 12pm AEST
+    - cron: '0 14 * * *'   # 12am AEST once daily
   workflow_dispatch:
-
 jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Install dependencies
         run: pip install requests
-
       - name: Run expiry checker
         env:
           AIRTABLE_TOKEN:         ${{ secrets.AIRTABLE_TOKEN }}
@@ -33,4 +26,3 @@ jobs:
           SUPABASE_URL:           ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY:   ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: python scripts/expiry_checker.py
-The good news: the script uses requests directly for Supabase (
