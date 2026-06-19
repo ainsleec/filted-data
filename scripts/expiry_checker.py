@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Filted — eBay Expiry Checker + Supabase Price Tracker
-Runs via GitHub Actions on a schedule.
-Checks all Active sightings in Airtable against eBay Browse API.
+Runs via GitHub Actions once daily.
+Checks 2000 Active sightings per run against eBay Browse API.
 Updates status to Expired in Airtable and stamps ended_at in Supabase.
 """
 
@@ -40,67 +40,40 @@ def get_supabase_headers():
     }
 
 
-def supabase_get(path, params=None):
-    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-        return []
-    resp = requests.get(
-        f"{SUPABASE_URL}/rest/v1/{path}",
-        headers=get_supabase_headers(),
-        params=params,
-        timeout=15
-    )
-    return resp.json() if resp.ok else []
-
-
-def supabase_patch(path, match_params, data):
-    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-        return False
-    resp = requests.patch(
-        f"{SUPABASE_URL}/rest/v1/{path}",
-        headers=get_supabase_headers(),
-        params=match_params,
-        json=data,
-        timeout=15
-    )
-    return resp.ok
-
-
 def load_supabase_active_listings():
+    """Load all active Supabase listings in one call for ended_at stamping."""
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-        print("   ⚠️  Supabase not configured — skipping price observations")
+        print("   ⚠️  Supabase not configured — skipping")
         return {}
-    rows = supabase_get("listings", params={
-        "select":   "id,ebay_item_id,listed_price",
-        "ended_at": "is.null",
-    })
-    return {str(r["ebay_item_id"]): r for r in rows if r.get("ebay_item_id")}
-
-
-def append_price_observation(listing_id, new_price, date_str):
-    """Append price observation to price_history if price changed."""
-    rows = supabase_get("listings", params={
-        "select": "price_history",
-        "id":     f"eq.{listing_id}",
-    })
-    if not rows:
-        return False
-    history    = rows[0].get("price_history") or []
-    last_price = history[-1]["price"] if history else None
-    if new_price == last_price:
-        return False
-    history.append({"date": date_str, "price": new_price})
-    return supabase_patch("listings", {"id": f"eq.{listing_id}"}, {"price_history": history})
-
-
-def mark_listing_ended(listing_id, reason):
-    return supabase_patch(
-        "listings",
-        {"id": f"eq.{listing_id}"},
-        {
-            "ended_at":     datetime.now(timezone.utc).isoformat(),
-            "ended_reason": reason,
-        }
+    resp = requests.get(
+        f"{SUPABASE_URL}/rest/v1/listings",
+        headers=get_supabase_headers(),
+        params={"select": "id,ebay_item_id", "ended_at": "is.null"},
+        timeout=30
     )
+    if not resp.ok:
+        print(f"   ⚠️  Supabase load failed: {resp.status_code}")
+        return {}
+    rows = resp.json()
+    return {str(r["ebay_item_id"]): r["id"] for r in rows if r.get("ebay_item_id")}
+
+
+def mark_listings_ended(listing_ids, reason):
+    """Batch mark multiple listings as ended in one Supabase call per batch."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY or not listing_ids:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    # Supabase doesn't support bulk patch by id list easily, do in small batches
+    for i in range(0, len(listing_ids), 50):
+        batch = listing_ids[i:i+50]
+        id_list = ",".join(batch)
+        requests.patch(
+            f"{SUPABASE_URL}/rest/v1/listings",
+            headers=get_supabase_headers(),
+            params={"id": f"in.({id_list})"},
+            json={"ended_at": now, "ended_reason": reason},
+            timeout=15
+        )
 
 
 # ── eBay OAuth token ──────────────────────────────────────────────────────────
@@ -133,17 +106,15 @@ def check_listing_status(item_id, ebay_headers):
             headers=ebay_headers, timeout=15
         )
         if resp.status_code == 404:
-            return "Expired", None
+            return "Expired"
         if resp.status_code == 200:
-            data      = resp.json()
-            price_str = data.get("price", {}).get("value")
-            price_val = float(price_str) if price_str else None
+            data = resp.json()
 
             end_date_raw = data.get("itemEndDate", "")
             if end_date_raw:
                 end_dt = datetime.fromisoformat(end_date_raw.replace("Z", "+00:00"))
                 if end_dt < datetime.now(timezone.utc):
-                    return "Expired", None
+                    return "Expired"
 
             availabilities = data.get("estimatedAvailabilities", [])
             if availabilities:
@@ -152,18 +123,18 @@ def check_listing_status(item_id, ebay_headers):
                 qty_sold      = int(avail.get("estimatedSoldQuantity", 0))
                 qty_remaining = int(avail.get("estimatedRemainingQuantity", 1))
                 if status == "SOLD_OUT" or qty_sold > 0 or qty_remaining == 0:
-                    return "Expired", price_val
+                    return "Expired"
                 if status in ("UNAVAILABLE", "OUT_OF_STOCK"):
-                    return "Expired", None
+                    return "Expired"
                 if status == "IN_STOCK":
-                    return "Active", price_val
+                    return "Active"
 
             if data.get("buyingOptions"):
-                return "Active", price_val
-            return "Expired", None
+                return "Active"
+            return "Expired"
     except Exception:
         pass
-    return "Active", None
+    return "Active"
 
 
 # ── Airtable helpers ──────────────────────────────────────────────────────────
@@ -199,25 +170,38 @@ def push_updates(ended_ids, still_active_ids):
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     url_at  = f"https://api.airtable.com/v0/{AIRTABLE_BASE}/{RESALE_SIGHTINGS_TABLE}"
 
-    updates = (
-        [{"id": rid, "fields": {"Status": "Expired", "Last Checked": now_iso}} for rid in ended_ids] +
-        [{"id": rid, "fields": {"Last Checked": now_iso}} for rid in still_active_ids]
-    )
+    # Expired first — most important
+    expired_updates = [{"id": rid, "fields": {"Status": "Expired", "Last Checked": now_iso}} for rid in ended_ids]
+    active_updates  = [{"id": rid, "fields": {"Last Checked": now_iso}} for rid in still_active_ids]
 
     errors = 0
-    for i in range(0, len(updates), 10):
-        resp = requests.patch(url_at, headers=HEADERS_AT, json={"records": updates[i:i + 10]})
+
+    print(f"   Updating {len(expired_updates)} expired...")
+    for i in range(0, len(expired_updates), 10):
+        resp = requests.patch(url_at, headers=HEADERS_AT, json={"records": expired_updates[i:i+10]})
         if not resp.ok:
-            print(f"  ⚠️  Batch {i // 10 + 1} error: {resp.text[:200]}")
             errors += 1
-        time.sleep(0.2)
-    return len(updates), errors
+            if errors <= 3:
+                print(f"   ⚠️  Batch error: {resp.status_code} {resp.text[:80]}")
+        if (i // 10) % 20 == 0 and i > 0:
+            print(f"   ... {min(i+10, len(expired_updates))}/{len(expired_updates)} expired updated")
+        time.sleep(0.1)
+
+    print(f"   Updating {len(active_updates)} still active...")
+    for i in range(0, len(active_updates), 10):
+        resp = requests.patch(url_at, headers=HEADERS_AT, json={"records": active_updates[i:i+10]})
+        if not resp.ok:
+            errors += 1
+        if (i // 10) % 50 == 0 and i > 0:
+            print(f"   ... {min(i+10, len(active_updates))}/{len(active_updates)} active updated")
+        time.sleep(0.1)
+
+    return len(expired_updates) + len(active_updates), errors
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     run_start = datetime.now(timezone.utc)
-    today     = run_start.strftime("%Y-%m-%d")
     print(f"🔄 Filted — eBay Expiry Checker")
     print(f"   {run_start.strftime('%Y-%m-%d %H:%M UTC')}\n")
 
@@ -230,7 +214,7 @@ def main():
 
     print("\n📊 Loading active listings from Supabase...")
     sb_listings = load_supabase_active_listings()
-    print(f"   {len(sb_listings)} active listings loaded for price tracking")
+    print(f"   {len(sb_listings)} active listings loaded")
 
     print("\n📦 Loading active sightings from Airtable...")
     all_sightings = load_active_sightings()
@@ -267,32 +251,31 @@ def main():
     print(f"   {len(to_check)} to check | {skipped_fresh} too fresh | {skipped_no_id} no ID/URL\n")
 
     print("🔍 Checking eBay listing status...")
-    ended_ids       = []
+    ended_ids        = []
+    ended_sb_ids     = []
     still_active_ids = []
-    price_updates   = 0
 
     for i, rec in enumerate(to_check):
-        status, current_price = check_listing_status(rec["item_id"], ebay_headers)
+        status = check_listing_status(rec["item_id"], ebay_headers)
 
         if status == "Expired":
             ended_ids.append(rec["id"])
-            sb = sb_listings.get(rec["item_id"])
-            if sb:
-                mark_listing_ended(sb["id"], "expired")
-
-        elif status == "Active":
+            sb_id = sb_listings.get(rec["item_id"])
+            if sb_id:
+                ended_sb_ids.append(sb_id)
+        else:
             still_active_ids.append(rec["id"])
-            sb = sb_listings.get(rec["item_id"])
-            if sb and current_price:
-                if append_price_observation(sb["id"], current_price, today):
-                    price_updates += 1
 
         time.sleep(0.3)
         if (i + 1) % 100 == 0:
-            print(f"   ... {i + 1}/{len(to_check)} — expired: {len(ended_ids)}, price changes: {price_updates}")
+            print(f"   ... {i + 1}/{len(to_check)} — expired: {len(ended_ids)}")
 
     print(f"\n   Expired: {len(ended_ids)} | Still active: {len(still_active_ids)}")
-    print(f"   Price changes logged to Supabase: {price_updates}")
+
+    # Batch mark ended in Supabase
+    if ended_sb_ids:
+        print(f"\n📊 Marking {len(ended_sb_ids)} listings ended in Supabase...")
+        mark_listings_ended(ended_sb_ids, "expired")
 
     print(f"\n📝 Applying updates to Airtable...")
     total_updated, err_count = push_updates(ended_ids, still_active_ids)
