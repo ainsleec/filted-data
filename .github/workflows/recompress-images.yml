@@ -1,0 +1,25 @@
+name: Recompress Garment Images
+
+on:
+  workflow_dispatch: {}   # manual trigger only — this is a one-off fix, not scheduled
+
+jobs:
+  recompress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install pillow requests supabase
+
+      - name: Run recompression
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: python scripts/recompress_images.py
