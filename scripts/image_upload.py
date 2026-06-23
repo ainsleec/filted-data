@@ -1,6 +1,8 @@
+import io
 import os
 import time
 import requests
+from PIL import Image
 from pyairtable import Api
 
 AIRTABLE_API_KEY = os.environ["AIRTABLE_API_KEY"]
@@ -10,12 +12,27 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 BUCKET = "garment-images"
 
+MAX_DIMENSION = 800
+JPEG_QUALITY = 80
+
 headers = {
     "apikey": SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
 }
 
-# Fetch all already-permanent airtable_ids in one batch
+def compress_image(image_bytes, max_dimension=MAX_DIMENSION, quality=JPEG_QUALITY):
+    img = Image.open(io.BytesIO(image_bytes))
+    if img.mode in ("RGBA", "P"):
+        img = img.convert("RGB")
+    if max(img.width, img.height) > max_dimension:
+        ratio = max_dimension / max(img.width, img.height)
+        new_size = (int(img.width * ratio), int(img.height * ratio))
+        img = img.resize(new_size, Image.LANCZOS)
+    output = io.BytesIO()
+    img.save(output, format="JPEG", quality=quality, optimize=True)
+    return output.getvalue()
+
+# Fetch already-uploaded garments from Supabase
 print("Fetching already-uploaded garments from Supabase...")
 already_done = set()
 offset = 0
@@ -33,11 +50,12 @@ while True:
     offset += 1000
 print(f"  {len(already_done)} already uploaded — will skip these")
 
+# Fetch all garments from Airtable
 print("Fetching all garments from Airtable...")
 api = Api(AIRTABLE_API_KEY)
 table = api.table(AIRTABLE_BASE_ID, GARMENTS_TABLE_ID)
 all_garments = table.all(fields=["Image 1"])
-print(f"{len(all_garments)} garments fetched")
+print(f"  {len(all_garments)} garments fetched")
 
 uploaded = skipped = errors = 0
 
@@ -60,6 +78,7 @@ for record in all_garments:
 
     path = f"{airtable_id}.jpg"
 
+    # Download from Airtable
     try:
         img_res = requests.get(image_url, timeout=15)
         if img_res.status_code != 200:
@@ -69,10 +88,18 @@ for record in all_garments:
         errors += 1
         continue
 
+    # Compress before uploading
+    try:
+        compressed = compress_image(img_res.content)
+    except Exception:
+        # If compression fails, fall back to original
+        compressed = img_res.content
+
+    # Upload to Supabase Storage (no upsert — bucket is clean)
     upload = requests.post(
         f"{SUPABASE_URL}/storage/v1/object/{BUCKET}/{path}",
-        headers={**headers, "Content-Type": "image/jpeg", "x-upsert": "true"},
-        data=img_res.content,
+        headers={**headers, "Content-Type": "image/jpeg"},
+        data=compressed,
     )
 
     if upload.status_code in (200, 201):
@@ -84,10 +111,11 @@ for record in all_garments:
         )
         uploaded += 1
         if uploaded % 100 == 0:
-            print(f"  {uploaded} uploaded, {errors} errors so far...")
+            print(f"  {uploaded} uploaded, {skipped} skipped, {errors} errors...", flush=True)
     else:
+        print(f"  Upload failed {airtable_id}: {upload.status_code} {upload.text}", flush=True)
         errors += 1
 
     time.sleep(0.05)
 
-print(f"Done — uploaded: {uploaded}, skipped: {skipped}, errors: {errors}")
+print(f"\nDone — uploaded: {uploaded}, skipped: {skipped}, errors: {errors}")
