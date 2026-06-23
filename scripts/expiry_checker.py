@@ -68,12 +68,15 @@ def mark_listings_ended(listing_ids, reason):
         batch = listing_ids[i:i+50]
         id_list = ",".join(batch)
         requests.patch(
-            f"{SUPABASE_URL}/rest/v1/listings",
-            headers=get_supabase_headers(),
-            params={"id": f"in.({id_list})"},
-            json={"ended_at": now, "ended_reason": reason},
-            timeout=15
-        )
+    f"{SUPABASE_URL}/rest/v1/listings",
+    headers=get_supabase_headers(),
+    params={
+        "id": f"in.({id_list})",
+        "or": "(ended_reason.is.null,ended_reason.neq.sold)",  # never clobber a confirmed sale
+    },
+    json={"ended_at": now, "ended_reason": reason},
+    timeout=15,
+)
 
 
 # ── eBay OAuth token ──────────────────────────────────────────────────────────
