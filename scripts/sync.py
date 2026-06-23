@@ -71,8 +71,12 @@ def slugify(text: str) -> str:
     return text.strip("-")[:80]
 
 
-def build_garment_slug(name: str, product_code: str, airtable_id: str) -> str:
+def build_garment_slug(name: str, colour: str, product_code: str, airtable_id: str) -> str:
+    """Colour-based slug with product code fallback, then Airtable ID last resort."""
     name_slug = slugify(name)
+    colour_slug = slugify(colour)
+    if colour_slug:
+        return f"{name_slug}-{colour_slug}"[:80]
     code_slug = slugify(product_code)
     if code_slug:
         return f"{name_slug}-{code_slug}"[:80]
@@ -335,12 +339,13 @@ def build_garment_fields(
 
     slug_base    = get_str(at_fields.get("Webflow Slug")) or name
     product_code = get_str(at_fields.get("Product Code"))
+    colour       = get_str(at_fields.get("Product Colour"))
 
     fields = {
         "name":           name,
-        "slug":           build_garment_slug(slug_base, product_code, airtable_id),
+        "slug":           build_garment_slug(slug_base, colour, product_code, airtable_id),
         "style-id":       product_code,
-        "product-colour": get_str(at_fields.get("Product Colour")),
+        "product-colour": colour,
         "category-3":     get_str(at_fields.get("Category")),
         "rrp":            at_fields.get("RRP") or 0,
     }
@@ -477,7 +482,7 @@ def main():
 
         existing_id = at_fields.get(WEBFLOW_ID_FIELD)
         if existing_id:
-            wf_fields.pop("slug", None)
+            wf_fields.pop("slug", None)  # Freeze: never change a live URL
             if webflow_update_item(CAMPAIGNS_COLLECTION_ID, existing_id, wf_fields):
                 updated += 1
                 print("    ✓ Updated")
@@ -556,7 +561,7 @@ def main():
             skipped += 1
             continue
 
-existing_id = at_fields.get(WEBFLOW_ID_FIELD)
+        existing_id = at_fields.get(WEBFLOW_ID_FIELD)
         if existing_id:
             wf_fields.pop("slug", None)  # Freeze: never change a live URL
             if webflow_update_item(GARMENTS_COLLECTION_ID, existing_id, wf_fields):
@@ -627,7 +632,7 @@ existing_id = at_fields.get(WEBFLOW_ID_FIELD)
             continue
         existing_id = at_fields.get(WEBFLOW_ID_FIELD)
         if existing_id:
-            wf_fields.pop("slug", None)
+            wf_fields.pop("slug", None)  # Freeze: never change a live URL
             if webflow_update_item(SIGHTINGS_COLLECTION_ID, existing_id, wf_fields):
                 updated += 1
             else:
