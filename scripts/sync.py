@@ -477,6 +477,7 @@ def main():
 
         existing_id = at_fields.get(WEBFLOW_ID_FIELD)
         if existing_id:
+            wf_fields.pop("slug", None)
             if webflow_update_item(CAMPAIGNS_COLLECTION_ID, existing_id, wf_fields):
                 updated += 1
                 print("    ✓ Updated")
@@ -555,8 +556,9 @@ def main():
             skipped += 1
             continue
 
-        existing_id = at_fields.get(WEBFLOW_ID_FIELD)
+existing_id = at_fields.get(WEBFLOW_ID_FIELD)
         if existing_id:
+            wf_fields.pop("slug", None)  # Freeze: never change a live URL
             if webflow_update_item(GARMENTS_COLLECTION_ID, existing_id, wf_fields):
                 updated += 1
                 garment_lookup[airtable_id] = existing_id
@@ -625,6 +627,7 @@ def main():
             continue
         existing_id = at_fields.get(WEBFLOW_ID_FIELD)
         if existing_id:
+            wf_fields.pop("slug", None)
             if webflow_update_item(SIGHTINGS_COLLECTION_ID, existing_id, wf_fields):
                 updated += 1
             else:
