@@ -1,21 +1,26 @@
-name: Image Upload
+name: Upload Garment Images
+
 on:
-  workflow_dispatch:
-  schedule:
-    - cron: '0 2 * * *'  # runs daily at 2am UTC
+  workflow_dispatch: {}
 
 jobs:
   upload:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 360
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-python@v4
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install requests pyairtable
-      - run: python scripts/image_upload.py
+
+      - name: Install dependencies
+        run: pip install pillow requests pyairtable
+
+      - name: Upload images
         env:
           AIRTABLE_API_KEY: ${{ secrets.AIRTABLE_TOKEN }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: python scripts/image_upload.py
