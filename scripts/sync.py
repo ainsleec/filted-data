@@ -206,7 +206,7 @@ def upload_images_to_supabase(all_garments: list):
 
         path = f"{airtable_id}.jpg"
 
-        # Check if already in Supabase garments table as permanent URL
+        # Check if already uploaded
         check = requests.get(
             f"{supabase_url}/rest/v1/garments?airtable_id=eq.{airtable_id}&select=image_url",
             headers={**headers, "Content-Type": "application/json"},
@@ -217,7 +217,7 @@ def upload_images_to_supabase(all_garments: list):
                 skipped += 1
                 continue
 
-        # Download fresh image from Airtable
+        # Download from Airtable
         try:
             img_res = requests.get(image_url, timeout=15)
             if img_res.status_code != 200:
@@ -231,34 +231,27 @@ def upload_images_to_supabase(all_garments: list):
         # Upload to Supabase Storage
         upload = requests.post(
             f"{supabase_url}/storage/v1/object/garment-images/{path}",
-            headers={
-                **headers,
-                "Content-Type": "image/jpeg",
-                "x-upsert": "true",
-            },
+            headers={**headers, "Content-Type": "image/jpeg", "x-upsert": "true"},
             data=img_res.content,
         )
 
         if upload.status_code in (200, 201):
             permanent_url = f"{supabase_url}/storage/v1/object/public/garment-images/{path}"
-            # Update garment with permanent URL
             requests.patch(
                 f"{supabase_url}/rest/v1/garments?airtable_id=eq.{airtable_id}",
-                headers={
-                    **headers,
-                    "Content-Type": "application/json",
-                    "Prefer": "return=minimal",
-                },
+                headers={**headers, "Content-Type": "application/json", "Prefer": "return=minimal"},
                 json={"image_url": permanent_url},
             )
             uploaded += 1
+            if uploaded % 100 == 0:
+                print(f"  {uploaded} uploaded, {skipped} skipped, {errors} errors...", flush=True)
         else:
             print(f"    ⚠️  Upload failed {airtable_id}: {upload.status_code} {upload.text[:100]}")
             errors += 1
 
         time.sleep(0.05)
 
-    print(f"  Images: {uploaded} uploaded | {skipped} skipped (already permanent) | {errors} errors")
+    print(f"  Images: {uploaded} uploaded | {skipped} skipped | {errors} errors")
 
 
 # ── Content generation ────────────────────────────────────────────────────────
@@ -380,31 +373,18 @@ def build_sighting_fields(at_fields: dict, garment_webflow_id: str | None) -> di
 
     slug_suffix = item_id[-10:] if item_id else re.sub(r"[^\w]", "", title[:20])
     fields = {
-        "name":          title,
-        "slug":          f"{slugify(title[:40])}-{slug_suffix}",
-        "ebay-title":    title,
-        "listing-url":   get_str(at_fields.get("Listing URL")),
-        "listed-price":  at_fields.get("Listed Price") or 0,
-        "status":        get_str(at_fields.get("Status")),
-        "ebay-item-id":  item_id,
-        "date-listed":   get_str(at_fields.get("Date Listed")),
-        "seller-name":   get_str(at_fields.get("Seller Name")),
-        "condition":     get_str(at_fields.get("Condition")),
+        "name":           title,
+        "slug":           f"{slugify(title[:40])}-{slug_suffix}",
+        "listing-url":    get_str(at_fields.get("Listing URL")),
+        "listing-price":  at_fields.get("Listed Price") or 0,
+        "status":         get_str(at_fields.get("Status")),
+        "condition":      get_str(at_fields.get("Condition")),
+        "date-listed":    get_str(at_fields.get("Date Listed")),
+        "size":           get_str(at_fields.get("Size")),
     }
 
     if garment_webflow_id:
         fields["garment"] = garment_webflow_id
-
-    img = at_fields.get("eBay Image", [])
-    if img:
-        fields["ebay-image"] = {
-            "url": img[0].get("url") if isinstance(img[0], dict) else img[0],
-            "alt": title,
-        }
-
-    sold_price = at_fields.get("Sold Price")
-    if sold_price:
-        fields["sold-price"] = sold_price
 
     return fields
 
