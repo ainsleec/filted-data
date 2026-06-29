@@ -6,10 +6,10 @@ All secrets are injected as environment variables.
 Sync order:
   1. Build Designer lookup
   2. Sync Campaigns         (Airtable Collections → Webflow Campaigns)
-  3. Identify active garments
-  4. Sync Garments          (verified active sightings only)
-  5. Delete garments no longer with active sightings
-  6. Sync Sightings         (Verified Active → create/update; Expired/Removed → delete)
+  3. Identify garments to keep (active OR sold sightings)
+  4. Sync Garments          (active + sold sightings)
+  5. Delete garments with no active AND no sold sightings
+  6. Sync Sightings         (Active/Sold → create/update; Expired/Removed → delete)
   7. Upload images to Supabase Storage (permanent URLs)
   8. Save last sync timestamp to GitHub
 
@@ -26,6 +26,7 @@ import re
 import json
 import time
 import base64
+import unicodedata
 import requests
 from datetime import datetime, timezone
 from pyairtable import Api
@@ -63,25 +64,51 @@ KEEP_STATUSES  = {"Active", "Sold"}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def slugify(text: str) -> str:
+def slugify(text: str, fallback: str = "item") -> str:
+    """
+    Produce a Webflow-safe slug matching ^[_a-zA-Z0-9][-_a-zA-Z0-9]*$.
+
+    Transliterates accents (é → e) and drops anything non-ASCII (emoji ✨,
+    curly quotes “ ”, en-dashes –) so they can never reach Webflow. Always
+    returns a non-empty string with no leading/trailing hyphen.
+    """
+    if not text:
+        return fallback
+    # NFKD splits accented chars into base + combining mark; ascii-ignore then
+    # drops the marks and any fully non-ASCII char (emoji, smart quotes, dashes).
+    text = unicodedata.normalize("NFKD", str(text))
+    text = text.encode("ascii", "ignore").decode("ascii")
     text = text.lower().strip()
-    text = re.sub(r"[^\w\s-]", "", text)
+    text = re.sub(r"[^a-z0-9\s-]", "", text)   # ascii-only now, safe to strip rest
     text = re.sub(r"[\s_]+", "-", text)
     text = re.sub(r"-+", "-", text)
-    return text.strip("-")[:80]
+    text = text.strip("-")[:80].strip("-")      # re-strip in case truncation cut a hyphen
+    return text or fallback
+
+
+def _compose_slug(*parts: str) -> str:
+    """Join slug parts, dropping empties so there's never a leading/double hyphen."""
+    slug = "-".join(p for p in parts if p)
+    slug = re.sub(r"-+", "-", slug).strip("-")[:80].strip("-")
+    return slug
 
 
 def build_garment_slug(name: str, colour: str, product_code: str, airtable_id: str) -> str:
     """Colour-based slug with product code fallback, then Airtable ID last resort."""
-    name_slug = slugify(name)
-    colour_slug = slugify(colour)
+    name_slug   = slugify(name, fallback="")
+    colour_slug = slugify(colour, fallback="")
+    code_slug   = slugify(product_code, fallback="")
+    id_suffix   = slugify(airtable_id[-8:], fallback="") if airtable_id else ""
+
     if colour_slug:
-        return f"{name_slug}-{colour_slug}"[:80]
-    code_slug = slugify(product_code)
-    if code_slug:
-        return f"{name_slug}-{code_slug}"[:80]
-    id_suffix = airtable_id[-8:].lower() if airtable_id else ""
-    return f"{name_slug}-{id_suffix}"[:80] if id_suffix else name_slug
+        slug = _compose_slug(name_slug, colour_slug)
+    elif code_slug:
+        slug = _compose_slug(name_slug, code_slug)
+    else:
+        slug = _compose_slug(name_slug, id_suffix)
+
+    # Final guarantee: never empty, always pattern-valid.
+    return slug or id_suffix or "garment"
 
 
 def get_str(value, default=""):
@@ -376,17 +403,30 @@ def build_sighting_fields(at_fields: dict, garment_webflow_id: str | None) -> di
     if not title:
         return {}
 
-    slug_suffix = item_id[-10:] if item_id else re.sub(r"[^\w]", "", title[:20])
+    # ASCII-safe slug: title stem + a stable suffix (eBay item id, or title hash).
+    raw_suffix  = item_id[-10:] if item_id else title[:20]
+    slug_suffix = slugify(raw_suffix, fallback="")
+    base        = slugify(title[:40], fallback="")
+    slug        = _compose_slug(base, slug_suffix) or "sighting"
+
     fields = {
-        "name":           title,
-        "slug":           f"{slugify(title[:40])}-{slug_suffix}",
-        "listing-url":    get_str(at_fields.get("Listing URL")),
-        "listing-price":  at_fields.get("Listed Price") or 0,
-        "status":         get_str(at_fields.get("Status")),
-        "condition":      get_str(at_fields.get("Condition")),
-        "date-listed":    get_str(at_fields.get("Date Listed")),
-        "size":           get_str(at_fields.get("Size")),
+        "name":          title,
+        "slug":          slug,
+        "listing-url":   get_str(at_fields.get("Listing URL")),
+        "listing-price": at_fields.get("Listed Price") or 0,
+        "status":        get_str(at_fields.get("Status")),
+        # condition-2 is the new PLAIN TEXT field (old Option field "condition"
+        # was deleted; Webflow reserved its slug, so the replacement is condition-2).
+        # Plain text → send the raw string straight from Airtable, no option-id lookup.
+        "condition-2":   get_str(at_fields.get("Condition")),
+        "date-listed":   get_str(at_fields.get("Date Listed")),
+        "size":          get_str(at_fields.get("Size")),
     }
+
+    # Sold date (slug confirmed from collection details) — only sent when present.
+    date_sold = get_str(at_fields.get("Date Sold"))
+    if date_sold:
+        fields["date-sold"] = date_sold
 
     if garment_webflow_id:
         fields["garment"] = garment_webflow_id
@@ -501,7 +541,7 @@ def main():
 
     print(f"\n  Campaigns: {created} created | {updated} updated | {skipped} skipped | {errors} errors")
 
-    # ── Step 3: Identify active garments ─────────────────────────────────────
+    # ── Step 3: Identify garments to keep (active OR sold) ───────────────────
     print("\n" + "=" * 64)
     print("  Loading all sightings...")
     all_sightings = get_all_airtable_records(SIGHTINGS_TABLE_ID)
@@ -516,13 +556,20 @@ def main():
 
     print(f"  {len(active_sightings)} verified active | {len(sold_sightings)} sold | {len(cleanup_sightings)} to clean up")
 
-    active_garment_ids = set()
-    for r in active_sightings:
-        linked = r["fields"].get("Garment", [])
-        if linked:
-            active_garment_ids.add(linked[0])
+    def garment_ids_from(sightings):
+        ids = set()
+        for r in sightings:
+            linked = r["fields"].get("Garment", [])
+            if linked:
+                ids.add(linked[0])
+        return ids
 
-    # ── Step 4: Sync Garments ─────────────────────────────────────────────────
+    active_garment_ids = garment_ids_from(active_sightings)
+    sold_garment_ids   = garment_ids_from(sold_sightings)
+    # A garment is kept if anything (active OR sold) still references it.
+    keep_garment_ids   = active_garment_ids | sold_garment_ids
+
+    # ── Step 4: Sync Garments (active + sold) ────────────────────────────────
     print("\n" + "=" * 64)
     print("  Syncing: Garments")
     print("=" * 64)
@@ -530,9 +577,9 @@ def main():
     all_garments = get_all_airtable_records(GARMENTS_TABLE_ID)
     priority_garments = [
         g for g in all_garments
-        if g["id"] in active_garment_ids and g["fields"].get("Image 1")
+        if g["id"] in keep_garment_ids and g["fields"].get("Image 1")
     ]
-    print(f"  {len(priority_garments)} garments with verified active sightings + image")
+    print(f"  {len(priority_garments)} garments with active/sold sightings + image")
 
     garment_lookup = {}
     for g in all_garments:
@@ -581,14 +628,16 @@ def main():
 
     print(f"  Garments: {created} created | {updated} updated | {skipped} skipped | {errors} errors")
 
-    # ── Step 5: Delete garments no longer with active sightings ──────────────
-    print("\n  Cleaning up garments with no active sightings...")
+    # ── Step 5: Delete garments with no active AND no sold sightings ─────────
+    print("\n  Cleaning up garments with no active or sold sightings...")
     deleted = errors_d = 0
     for record in all_garments:
         existing_id = record["fields"].get(WEBFLOW_ID_FIELD)
         if not existing_id:
             continue
-        if record["id"] not in active_garment_ids:
+        # Keep anything still referenced by an active OR sold sighting — deleting
+        # a garment that holds a sold sighting both loses price history and 409s.
+        if record["id"] not in keep_garment_ids:
             if webflow_delete_item(GARMENTS_COLLECTION_ID, existing_id):
                 write_webflow_id_to_airtable(GARMENTS_TABLE_ID, record["id"], "")
                 deleted += 1
