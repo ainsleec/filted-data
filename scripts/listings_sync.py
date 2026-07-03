@@ -110,9 +110,12 @@ def load_sightings_to_sync():
 
 # ── Insert new listings into Supabase ──────────────────────────────────────────
 def insert_listings(rows):
-    """Bulk insert in batches of 50."""
+    """Bulk insert in batches of 50. On batch failure, retry rows individually
+    so one bad row doesn't sink the other 49 good ones."""
     inserted = 0
     errors   = 0
+    failed_rows = []
+
     for i in range(0, len(rows), 50):
         batch = rows[i:i + 50]
         resp = requests.post(
@@ -124,9 +127,29 @@ def insert_listings(rows):
         if resp.ok:
             inserted += len(batch)
         else:
-            errors += len(batch)
-            print(f"   ⚠️  Insert batch failed: {resp.status_code} {resp.text[:200]}")
+            print(f"   ⚠️  Batch failed ({resp.status_code}), retrying rows individually...")
+            for row in batch:
+                r = requests.post(
+                    f"{SUPABASE_URL}/rest/v1/listings",
+                    headers=get_supabase_headers(),
+                    json=[row],
+                    timeout=15
+                )
+                if r.ok:
+                    inserted += 1
+                else:
+                    errors += 1
+                    failed_rows.append((row.get("ebay_item_id"), r.status_code, r.text[:150]))
+                time.sleep(0.05)
         time.sleep(0.2)
+
+    if failed_rows:
+        print(f"\n   ⚠️  {len(failed_rows)} rows failed individually:")
+        for eid, code, msg in failed_rows[:15]:
+            print(f"      {eid} — {code} {msg}")
+        if len(failed_rows) > 15:
+            print(f"      ...and {len(failed_rows) - 15} more")
+
     return inserted, errors
 
 
@@ -141,9 +164,11 @@ def main():
         print()
 
     print("📊 Loading existing Supabase listings (for dedup)...")
-    existing_listings = load_all_supabase_rows("listings", "ebay_item_id")
+    existing_listings = load_all_supabase_rows("listings", "ebay_item_id,airtable_id")
     existing_ids = {str(r["ebay_item_id"]) for r in existing_listings if r.get("ebay_item_id")}
+    existing_airtable_ids = {r["airtable_id"] for r in existing_listings if r.get("airtable_id")}
     print(f"   {len(existing_ids)} existing listing IDs loaded")
+    print(f"   {len(existing_airtable_ids)} existing airtable_ids loaded")
 
     print("\n📊 Loading Supabase garments (for garment_id matching)...")
     garment_rows = load_all_supabase_rows("garments", "id,airtable_id")
@@ -156,6 +181,7 @@ def main():
 
     to_insert        = []
     already_synced    = 0
+    already_by_at_id  = 0
     no_item_id        = 0
     no_garment_match  = 0
 
@@ -171,6 +197,10 @@ def main():
             already_synced += 1
             continue
 
+        if rec["id"] in existing_airtable_ids:
+            already_by_at_id += 1
+            continue
+
         linked_garments = f.get("Garment", [])
         garment_airtable_id = linked_garments[0] if linked_garments else None
         garment_id = garment_lookup.get(garment_airtable_id) if garment_airtable_id else None
@@ -179,6 +209,8 @@ def main():
             no_garment_match += 1
             # Still insert — garment_id is nullable, can be backfilled later
             # once the sighting is matched to a garment in Airtable.
+
+        status = f.get("Status")
 
         row = {
             "airtable_id":  rec["id"],
@@ -190,17 +222,19 @@ def main():
             "condition":    f.get("Condition", "") or "",
             "listed_price": f.get("Listed Price"),
             "started_at":   f.get("Date Listed") or None,
+            # Always include these keys (even as None) so every row in a batch
+            # has an identical key set — PostgREST bulk insert rejects batches
+            # where object shapes differ.
+            "sold_price":   f.get("Listed Price") if status == "Sold" else None,
+            "sold_at":      (f.get("Date Sold") or None) if status == "Sold" else None,
         }
-
-        status = f.get("Status")
-        if status == "Sold":
-            row["sold_price"] = f.get("Listed Price")
-            row["sold_at"]    = f.get("Date Sold") or None
 
         to_insert.append(row)
         existing_ids.add(item_id)  # guard against dupes within this same run
+        existing_airtable_ids.add(rec["id"])
 
-    print(f"\n   Already synced: {already_synced}")
+    print(f"\n   Already synced (by eBay ID): {already_synced}")
+    print(f"   Already synced (by airtable_id, no eBay ID match): {already_by_at_id}")
     print(f"   Skipped — no eBay ID: {no_item_id}")
     print(f"   No garment match (inserted anyway, garment_id null): {no_garment_match}")
     print(f"   🔧 New listings to insert: {len(to_insert)}")
