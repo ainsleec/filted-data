@@ -1,0 +1,38 @@
+name: Listings Sync (Airtable → Supabase)
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (preview only, no writes)"
+        type: boolean
+        default: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run listings sync
+        env:
+          AIRTABLE_TOKEN:         ${{ secrets.AIRTABLE_TOKEN }}
+          AIRTABLE_BASE:          ${{ secrets.AIRTABLE_BASE }}
+          RESALE_SIGHTINGS_TABLE: ${{ secrets.RESALE_SIGHTINGS_TABLE }}
+          SUPABASE_URL:           ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY:   ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            python scripts/listings_sync.py --dry-run
+          else
+            python scripts/listings_sync.py
+          fi
