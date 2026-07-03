@@ -1,6 +1,10 @@
 name: Listings Sync (Airtable → Supabase)
 
 on:
+  schedule:
+    # Runs daily at 02:15 UTC — after expiry_checker.py's typical run,
+    # so newly-expired listings and their statuses are already settled.
+    - cron: "15 2 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -31,7 +35,10 @@ jobs:
           SUPABASE_URL:           ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY:   ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: |
-          if [ "${{ inputs.dry_run }}" = "true" ]; then
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            # Scheduled runs always execute live — no one is watching to toggle a checkbox.
+            python scripts/listings_sync.py
+          elif [ "${{ inputs.dry_run }}" = "true" ]; then
             python scripts/listings_sync.py --dry-run
           else
             python scripts/listings_sync.py
