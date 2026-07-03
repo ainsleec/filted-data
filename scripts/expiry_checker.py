@@ -68,15 +68,15 @@ def mark_listings_ended(listing_ids, reason):
         batch = listing_ids[i:i+50]
         id_list = ",".join(batch)
         requests.patch(
-    f"{SUPABASE_URL}/rest/v1/listings",
-    headers=get_supabase_headers(),
-    params={
-        "id": f"in.({id_list})",
-        "or": "(ended_reason.is.null,ended_reason.neq.sold)",  # never clobber a confirmed sale
-    },
-    json={"ended_at": now, "ended_reason": reason},
-    timeout=15,
-)
+            f"{SUPABASE_URL}/rest/v1/listings",
+            headers=get_supabase_headers(),
+            params={
+                "id": f"in.({id_list})",
+                "or": "(ended_reason.is.null,ended_reason.neq.sold)",  # never clobber a confirmed sale
+            },
+            json={"ended_at": now, "ended_reason": reason},
+            timeout=15,
+        )
 
 
 # ── eBay OAuth token ──────────────────────────────────────────────────────────
@@ -258,18 +258,18 @@ def main():
     ended_sb_ids     = []
     still_active_ids = []
 
-        for i, rec in enumerate(to_check):
-            status = check_listing_status(rec["item_id"], ebay_headers)
+    for i, rec in enumerate(to_check):
+        status = check_listing_status(rec["item_id"], ebay_headers)
 
-            if status == "Expired":
-                ended_ids.append(rec["id"])
-                sb_id = sb_listings.get(rec["item_id"])
-                if sb_id:
-                    ended_sb_ids.append(sb_id)
-                else:
-                    print(f"   ⚠️  No Supabase match for item_id={rec['item_id']!r} (Airtable rec {rec['id']})")
+        if status == "Expired":
+            ended_ids.append(rec["id"])
+            sb_id = sb_listings.get(rec["item_id"])
+            if sb_id:
+                ended_sb_ids.append(sb_id)
             else:
-                still_active_ids.append(rec["id"])
+                print(f"   ⚠️  No Supabase match for item_id={rec['item_id']!r} (Airtable rec {rec['id']})")
+        else:
+            still_active_ids.append(rec["id"])
 
         time.sleep(0.3)
         if (i + 1) % 100 == 0:
@@ -288,7 +288,6 @@ def main():
 
     elapsed = (datetime.now(timezone.utc) - run_start).seconds
     print(f"\n✅ Done in {elapsed}s")
-
 
 
 if __name__ == "__main__":
