@@ -41,20 +41,38 @@ def get_supabase_headers():
 
 
 def load_supabase_active_listings():
-    """Load all active Supabase listings in one call for ended_at stamping."""
+    """Load ALL active Supabase listings, paginating past PostgREST's default row cap."""
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
         print("   ⚠️  Supabase not configured — skipping")
         return {}
-    resp = requests.get(
-        f"{SUPABASE_URL}/rest/v1/listings",
-        headers=get_supabase_headers(),
-        params={"select": "id,ebay_item_id", "ended_at": "is.null"},
-        timeout=30
-    )
-    if not resp.ok:
-        print(f"   ⚠️  Supabase load failed: {resp.status_code}")
-        return {}
-    rows = resp.json()
+
+    page_size = 1000
+    offset    = 0
+    rows      = []
+
+    while True:
+        headers = get_supabase_headers()
+        headers["Range-Unit"] = "items"
+        headers["Range"]      = f"{offset}-{offset + page_size - 1}"
+
+        resp = requests.get(
+            f"{SUPABASE_URL}/rest/v1/listings",
+            headers=headers,
+            params={"select": "id,ebay_item_id", "ended_at": "is.null"},
+            timeout=30
+        )
+        if not resp.ok:
+            print(f"   ⚠️  Supabase load failed at offset {offset}: {resp.status_code}")
+            break
+
+        batch = resp.json()
+        rows.extend(batch)
+
+        if len(batch) < page_size:
+            break
+        offset += page_size
+
+    print(f"   📄 Paginated fetch: {len(rows)} total rows across {offset // page_size + 1} page(s)")
     return {str(r["ebay_item_id"]): r["id"] for r in rows if r.get("ebay_item_id")}
 
 
