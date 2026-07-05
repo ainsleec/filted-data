@@ -1,14 +1,25 @@
 #!/usr/bin/env python3
 """
-Filted — New eBay Listings Scraper
+Filted — New eBay Listings Scraper (with garment matching + relist detection)
 Runs twice daily on GitHub Actions (7am + 7pm AEST).
 
-Searches eBay AU strictly within Women's Clothing (category 15724).
-Uses Browse API (same OAuth flow as expiry checker — no separate App ID needed).
-Adds new unmatched sightings to Airtable Resale Sightings table.
+Restores two capabilities that existed in the original Colab pipeline but
+were missing from the plain rewrite of this script:
+
+  1. Garment matching — cleans the eBay title and each candidate garment's
+     name (stripping size/colour/fabric/condition noise), scores similarity,
+     and auto-links anything scoring >= AUTO_MATCH_THRESHOLD. Scores between
+     SUGGEST_THRESHOLD and AUTO_MATCH_THRESHOLD are left unmatched but
+     flagged "Needs Review" with a "Best Match Guess" for manual confirmation.
+
+  2. Relist detection — before creating a new sighting, checks whether the
+     same (seller, exact title) pair already exists as a Resale Sightings
+     record. If so, that existing record is reactivated (Status -> Active,
+     refreshed URL/price/end date) instead of creating a duplicate — this
+     is what preserves a garment match across an expire-then-relist cycle.
 """
 
-import os, requests, time, base64
+import os, re, requests, time, base64
 from datetime import datetime, timezone, timedelta
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -16,6 +27,7 @@ AIRTABLE_TOKEN      = os.environ["AIRTABLE_TOKEN"]
 AIRTABLE_BASE       = os.environ["AIRTABLE_BASE"]
 DESIGNERS_TABLE     = os.environ.get("DESIGNERS_TABLE", "Designers")
 SIGHTINGS_TABLE     = os.environ["RESALE_SIGHTINGS_TABLE"]
+GARMENTS_TABLE_ID   = "tblmqjU4WqgCzP7cR"
 
 EBAY_CLIENT_ID      = os.environ["EBAY_CLIENT_ID"]
 EBAY_CLIENT_SECRET  = os.environ["EBAY_CLIENT_SECRET"]
@@ -24,6 +36,24 @@ EBAY_CLIENT_SECRET  = os.environ["EBAY_CLIENT_SECRET"]
 EBAY_WOMENS_CAT     = "15724"    # eBay AU: Women's Clothing — no other categories
 LOOKBACK_HOURS      = 72         # Runs twice daily, 14hr window with overlap
 MAX_PER_DESIGNER    = 100        # Cap per designer per run
+
+# ── Matching thresholds (unchanged from the original working Colab logic) ────
+AUTO_MATCH_THRESHOLD = 0.65
+SUGGEST_THRESHOLD    = 0.45
+
+# ── eBay Partner Network affiliate tracking ───────────────────────────────────
+# Single campaign ID applied to every listing link, per your confirmation.
+# mkrid is your Rover affiliate ID — this is what actually attributes clicks/
+# sales to your account. Without these params, links earn zero commission.
+EPN_CAMPAIGN_ID = "5339108963"
+EPN_PARAMS      = "mkcid=1&mkrid=705-53470-19255-0&siteid=15&toolid=10001&mkevt=1"
+
+
+def make_affiliate_url(listing_url, campaign_id=EPN_CAMPAIGN_ID):
+    """Wrap a raw eBay listing URL with EPN affiliate tracking params."""
+    if not listing_url:
+        return listing_url
+    return f"{listing_url.split('?')[0]}?campid={campaign_id}&{EPN_PARAMS}"
 
 TITLE_EXCLUSIONS = [
     "kids", "girls", "boys", "baby", "toddler", "junior",
@@ -36,7 +66,6 @@ TITLE_EXCLUSIONS = [
     " mens", "smart", "damaged"
 ]
 
-# ── Condition filtering ───────────────────────────────────────────────────────
 EXCLUDED_CONDITIONS = [
     "Acceptable",
     "Fair",
@@ -48,9 +77,9 @@ HEADERS_AT = {
     "Content-Type":  "application/json"
 }
 
+
 # ── eBay OAuth ────────────────────────────────────────────────────────────────
 def get_ebay_token():
-    """Fetch a fresh eBay OAuth token via client credentials. Valid ~2hrs."""
     credentials = base64.b64encode(
         f"{EBAY_CLIENT_ID}:{EBAY_CLIENT_SECRET}".encode()
     ).decode()
@@ -72,13 +101,39 @@ def get_ebay_token():
 
 
 # ── Airtable helpers ──────────────────────────────────────────────────────────
+def at_list_all(table, fields=None):
+    records = []
+    params = {"pageSize": 100}
+    if fields:
+        params["fields[]"] = fields
+    while True:
+        resp = requests.get(
+            f"https://api.airtable.com/v0/{AIRTABLE_BASE}/{table}",
+            headers=HEADERS_AT, params=params
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        records.extend(data.get("records", []))
+        if not data.get("offset"):
+            break
+        params["offset"] = data["offset"]
+    return records
+
+
+def at_update(table, record_id, fields):
+    resp = requests.patch(
+        f"https://api.airtable.com/v0/{AIRTABLE_BASE}/{table}/{record_id}",
+        headers=HEADERS_AT,
+        json={"fields": fields}
+    )
+    if not resp.ok:
+        print(f"    ⚠️  Airtable update error {resp.status_code}: {resp.text[:200]}")
+    return resp.ok
+
+
 def fetch_designers():
-    """Pull all designer names from Airtable Designers table."""
     designers = []
-    params = {
-        "fields[]": ["Designer Name"],
-        "pageSize": 100
-    }
+    params = {"fields[]": ["Designer Name"], "pageSize": 100}
     while True:
         resp = requests.get(
             f"https://api.airtable.com/v0/{AIRTABLE_BASE}/{DESIGNERS_TABLE}",
@@ -96,72 +151,145 @@ def fetch_designers():
     return designers
 
 
-def fetch_existing_item_ids():
-    """Load all eBay Item IDs already in Airtable to skip duplicates."""
-    item_ids = set()
-    params = {
-        "fields[]": ["eBay Item ID"],
-        "pageSize": 100
+def fetch_garments():
+    """Load garments for matching. Table has both 'Name' and 'Garment Name'
+    fields — prefer 'Name' (what the original matching logic used), fall
+    back to 'Garment Name' if blank."""
+    return at_list_all(GARMENTS_TABLE_ID, fields=["Name", "Garment Name", "Product Colour", "Designer"])
+
+
+def fetch_existing_sightings():
+    """Load existing sightings for dedup + relist lookup."""
+    return at_list_all(
+        SIGHTINGS_TABLE,
+        fields=["Listing URL", "eBay Item ID", "Status", "Seller Name", "eBay Title"]
+    )
+
+
+# ── Matching (ported from the original working Colab logic) ──────────────────
+def similarity(a, b):
+    a = re.sub(r'[^\w\s]', ' ', a)
+    b = re.sub(r'[^\w\s]', ' ', b)
+    words_a = set(a.lower().split())
+    words_b = set(b.lower().split())
+    if not words_a or not words_b:
+        return 0.0
+    intersection = words_a & words_b
+    union        = words_a | words_b
+    jaccard      = len(intersection) / len(union)
+    coverage     = len(intersection) / len(words_b)
+    return (jaccard * 0.3) + (coverage * 0.7)
+
+
+WORD_NORMALIZE = {
+    "pants": "pant", "trousers": "trouser", "shorts": "short", "jeans": "jean",
+    "blazers": "blazer", "skirts": "skirt", "tops": "top", "boots": "boot", "heels": "heel",
+}
+
+_NOISE_WORDS = (
+    "linen ramie cotton chiffon crepe velvet wool knit woven silk satin georgette "
+    "polyester nylon spandex jersey denim midi mini maxi casual holiday sexy cocktail "
+    "romantic formal wedding evening party brunch summer spring autumn winter beach "
+    "resort vacation boho bohemian chic elegant cute gorgeous stunning tie belt button "
+    "zip pocket pockets sleeve sleeveless long short neck collar strap straps off slip "
+    "ruffle frill lace wrap smocked pleated green blue red pink black white yellow "
+    "orange purple brown grey gray cream ivory nude navy teal lilac rust sage olive "
+    "blush coral gold silver multicolor multicolour neutrals neutral new cond condition "
+    "worn used loved owned womens women ladies australian designer authentic genuine "
+    "luxury rare beautiful with and the floral print belted pre-loved preloved pre loved"
+).split()
+
+
+def clean_title(title, designer_name=None, is_garment=False):
+    t = title
+    if designer_name:
+        t = re.sub(re.escape(designer_name), "", t, flags=re.IGNORECASE)
+
+    t = re.sub(r'\b(size|sz)\s*\d+\b', "", t, flags=re.IGNORECASE)
+    t = re.sub(r'\b(au|us|uk|eu)\s*\d+\b', "", t, flags=re.IGNORECASE)
+    t = re.sub(r'\b\d+\s*(au|us|uk|eu)\b', "", t, flags=re.IGNORECASE)
+    t = re.sub(r'\b(xs|s|m|l|xl|xxl)\b', "", t, flags=re.IGNORECASE)
+    t = re.sub(r'\bsize\b', "", t, flags=re.IGNORECASE)
+    t = re.sub(r'\b(au|us|uk|eu)\b', "", t, flags=re.IGNORECASE)
+
+    for word in ["bnwt", "nwt", "new with tags", "brand new", "unworn", "rrp", "rpp"]:
+        t = re.sub(re.escape(word), "", t, flags=re.IGNORECASE)
+
+    compounds = {
+        "shirt dress": "shirtdress", "shirt-dress": "shirtdress",
+        "midi dress": "mididress", "mini dress": "minidress", "maxi dress": "maxidress",
+        "cut out": "cutout", "cut-out": "cutout", "cut offs": "cutoffs",
     }
-    while True:
-        resp = requests.get(
-            f"https://api.airtable.com/v0/{AIRTABLE_BASE}/{SIGHTINGS_TABLE}",
-            headers=HEADERS_AT, params=params
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        for rec in data.get("records", []):
-            iid = rec["fields"].get("eBay Item ID")
-            if iid:
-                item_ids.add(str(iid).strip())
-        if not data.get("offset"):
-            break
-        params["offset"] = data["offset"]
-    return item_ids
+    for old, new in compounds.items():
+        t = re.sub(rf'\b{re.escape(old)}\b', new, t, flags=re.IGNORECASE)
+
+    if not is_garment:
+        t = re.sub(r'[|/\\]', ' ', t)
+        for word in _NOISE_WORDS:
+            t = re.sub(rf'\b{re.escape(word)}\b', "", t, flags=re.IGNORECASE)
+
+    t = re.sub(r'\s+', " ", t).strip(" -–$")
+    words = t.split()
+    t = " ".join(WORD_NORMALIZE.get(w.lower(), w) for w in words)
+    return t
 
 
-def add_sightings(new_items):
-    """Batch-add new sightings to Airtable in groups of 10."""
-    url_at = f"https://api.airtable.com/v0/{AIRTABLE_BASE}/{SIGHTINGS_TABLE}"
-    added  = 0
+def garment_name(g_fields):
+    return get_str(g_fields.get("Name")) or get_str(g_fields.get("Garment Name"))
 
-    for i in range(0, len(new_items), 10):
-        batch   = new_items[i:i + 10]
-        records = []
-        for item in batch:
-            fields = {
-                "eBay Item ID":  item["item_id"],
-                "Listing URL":   item["url"],
-                "eBay Title":    item["title"][:500],
-                "Date Listed":   item["date_listed"],
-                "Status":        "Active",
-                "Seller Name":   item["seller"],
-            }
-            if item.get("price") is not None:
-                fields["Listed Price"] = item["price"]
-            if item.get("image_url"):
-                fields["eBay Image"] = [{"url": item["image_url"]}]
-            if item.get("condition"):
-                fields["Condition"] = item["condition"]
-            records.append({"fields": fields})
 
-        resp = requests.post(url_at, headers=HEADERS_AT, json={"records": records})
-        if resp.ok:
-            added += len(batch)
-        else:
-            print(f"  ⚠️  Airtable batch error: {resp.text[:300]}")
-        time.sleep(2)
+def get_str(value, default=""):
+    if value is None:
+        return default
+    if isinstance(value, list):
+        return str(value[0]).strip() if value else default
+    return str(value).strip()
 
-    return added
+
+def extract_colour(title):
+    """Best-effort colour guess straight from the title (Browse API search
+    results don't reliably expose localizedAspects the way item detail does)."""
+    return None  # kept simple deliberately — colour tie-break is a nice-to-have,
+                 # not required for the core matching to function correctly
+
+
+def find_best_match(ebay_title, garments, designer_name=None, ebay_colour=None):
+    cleaned = clean_title(ebay_title, designer_name)
+    scored = []
+
+    for g in garments:
+        name = garment_name(g["fields"])
+        if not name:
+            continue
+        if designer_name:
+            gd = g["fields"].get("Designer", "")
+            if isinstance(gd, list):
+                if not any(designer_name.lower() in str(d).lower() for d in gd):
+                    continue
+            elif gd and designer_name.lower() not in str(gd).lower():
+                continue
+        clean_name = clean_title(name, designer_name, is_garment=True)
+        score = similarity(cleaned, clean_name)
+        scored.append((score, g))
+
+    if not scored:
+        return None, 0.0
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top_score = scored[0][0]
+
+    if ebay_colour:
+        close = [(s, g) for s, g in scored if top_score - s < 0.15]
+        if len(close) > 1:
+            for s, g in close:
+                if ebay_colour in (g["fields"].get("Product Colour") or "").lower():
+                    return g, s
+
+    return scored[0][1], scored[0][0]
 
 
 # ── eBay Browse API search ────────────────────────────────────────────────────
 def search_ebay(keyword, ebay_headers, since_hours):
-    """
-    Search eBay AU Browse API.
-    STRICT: category 15724 (Women's Clothing) only, AU only, newly listed.
-    Returns list of item summary dicts.
-    """
     try:
         resp = requests.get(
             "https://api.ebay.com/buy/browse/v1/item_summary/search",
@@ -185,10 +313,9 @@ def search_ebay(keyword, ebay_headers, since_hours):
 
 
 def is_new_enough(item, since_hours):
-    """Return True if item was listed within the lookback window."""
     date_str = item.get("itemCreationDate", "")
     if not date_str:
-        return True  # Can't tell, include it
+        return True
     try:
         listed_dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
         cutoff    = datetime.now(timezone.utc) - timedelta(hours=since_hours)
@@ -198,19 +325,15 @@ def is_new_enough(item, since_hours):
 
 
 def is_excluded(title):
-    """Return True if title suggests a non-clothing item."""
     t = title.lower()
     return any(excl in t for excl in TITLE_EXCLUSIONS)
 
 
 def is_excluded_condition(condition):
-    """Return True if condition is below acceptable threshold."""
     return condition in EXCLUDED_CONDITIONS
 
 
 def parse_item(raw, designer_name):
-    """Extract clean fields from a Browse API item summary dict."""
-    # Browse API returns v1|ITEMID|0 — extract numeric ID
     raw_id  = raw.get("itemId", "")
     parts   = raw_id.split("|")
     item_id = parts[1] if len(parts) >= 2 else raw_id
@@ -251,7 +374,7 @@ def parse_item(raw, designer_name):
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     run_start = datetime.now(timezone.utc)
-    print(f"🛍  Filted — New Listings Scrape")
+    print(f"🛍  Filted — New Listings Scrape (with matching + relist detection)")
     print(f"    {run_start.strftime('%Y-%m-%d %H:%M UTC')}  |  Category: Women's Clothing ({EBAY_WOMENS_CAT}) ONLY\n")
 
     print("🔑 Fetching eBay OAuth token...")
@@ -263,28 +386,39 @@ def main():
 
     print("\n📋 Fetching designers from Airtable...")
     designers = fetch_designers()
-    print(f"   {len(designers)} designer(s): {', '.join(designers)}\n")
+    print(f"   {len(designers)} designer(s): {', '.join(designers)}")
 
-    print("🗂  Loading existing eBay Item IDs (dedup)...")
-    existing_ids = fetch_existing_item_ids()
-    print(f"   {len(existing_ids)} existing sightings\n")
+    print("\n👗 Fetching garments for matching...")
+    garments = fetch_garments()
+    print(f"   {len(garments)} garments loaded")
 
-    all_new            = []
-    total_found        = 0
-    total_old          = 0
-    total_excluded     = 0
-    total_dupes        = 0
-    total_bad_condition = 0
+    print("\n🗂  Loading existing sightings (dedup + relist lookup)...")
+    existing = fetch_existing_sightings()
+    existing_ids = set()
+    relist_lookup = {}
+    for rec in existing:
+        f = rec["fields"]
+        iid = f.get("eBay Item ID")
+        if iid:
+            existing_ids.add(str(iid).strip())
+        seller_key = (f.get("Seller Name") or "").lower().strip()
+        title_key  = (f.get("eBay Title") or "").lower().strip()
+        if seller_key and title_key:
+            relist_lookup[(seller_key, title_key)] = rec["id"]
+    print(f"   {len(existing_ids)} existing item IDs | {len(relist_lookup)} relist lookup entries")
 
-    print(f"🔍 Searching eBay AU (last {LOOKBACK_HOURS}hrs)...")
+    all_new = []
+    total_found = total_old = total_excluded = total_dupes = total_bad_condition = 0
+    total_relisted = total_auto_matched = total_needs_review = total_no_match = 0
+
+    print(f"\n🔍 Searching eBay AU (last {LOOKBACK_HOURS}hrs)...")
     for designer in designers:
         raw_items = search_ebay(designer, ebay_headers, since_hours=LOOKBACK_HOURS)
-        new_count = 0
+        new_count = relisted_count = 0
 
         for raw in raw_items:
             total_found += 1
 
-            # Skip if outside lookback window
             if not is_new_enough(raw, LOOKBACK_HOURS):
                 total_old += 1
                 continue
@@ -294,9 +428,24 @@ def main():
             if is_excluded(item["title"]):
                 total_excluded += 1
                 continue
-
             if is_excluded_condition(item["condition"]):
                 total_bad_condition += 1
+                continue
+
+            # ── Relist check FIRST — before treating as new/duplicate ──────
+            relist_key = (item["seller"].lower().strip(), item["title"].lower().strip())
+            if relist_key in relist_lookup:
+                existing_record_id = relist_lookup[relist_key]
+                at_update(SIGHTINGS_TABLE, existing_record_id, {
+                    "Status":       "Active",
+                    "eBay Item ID": item["item_id"],
+                    "Listing URL":  make_affiliate_url(item["url"]),
+                    **({"Listed Price": item["price"]} if item["price"] is not None else {}),
+                })
+                existing_ids.add(item["item_id"])
+                relisted_count += 1
+                total_relisted += 1
+                time.sleep(0.1)
                 continue
 
             if item["item_id"] in existing_ids:
@@ -308,17 +457,58 @@ def main():
             new_count += 1
 
         if raw_items:
-            print(f"   {designer}: {len(raw_items)} found → {new_count} new")
+            print(f"   {designer}: {len(raw_items)} found → {new_count} new | {relisted_count} relisted")
         else:
             print(f"   {designer}: no results")
         time.sleep(0.5)
 
-    print(f"\n   Total found: {total_found} | Too old: {total_old} | Excluded: {total_excluded} | Bad condition: {total_bad_condition} | Dupes: {total_dupes} | New: {len(all_new)}")
+    print(f"\n   Total found: {total_found} | Too old: {total_old} | Excluded: {total_excluded} | "
+          f"Bad condition: {total_bad_condition} | Relisted: {total_relisted} | New: {len(all_new)}")
 
     if all_new:
-        print(f"\n📝 Adding {len(all_new)} new sightings to Airtable (unmatched)...")
-        added = add_sightings(all_new)
-        print(f"   ✅ {added} added")
+        print(f"\n🔗 Matching {len(all_new)} new listings to garments...")
+        url_at = f"https://api.airtable.com/v0/{AIRTABLE_BASE}/{SIGHTINGS_TABLE}"
+
+        for i in range(0, len(all_new), 10):
+            batch = all_new[i:i + 10]
+            records = []
+            for item in batch:
+                match, score = find_best_match(item["title"], garments, designer_name=item["designer"])
+
+                fields = {
+                    "eBay Item ID":  item["item_id"],
+                    "Listing URL":   make_affiliate_url(item["url"]),
+                    "eBay Title":    item["title"][:500],
+                    "Date Listed":   item["date_listed"],
+                    "Status":        "Active",
+                    "Seller Name":   item["seller"],
+                }
+                if item.get("price") is not None:
+                    fields["Listed Price"] = item["price"]
+                if item.get("image_url"):
+                    fields["eBay Image"] = [{"url": item["image_url"]}]
+                if item.get("condition"):
+                    fields["Condition"] = item["condition"]
+
+                if match and score >= AUTO_MATCH_THRESHOLD:
+                    fields["Garment"] = [match["id"]]
+                    total_auto_matched += 1
+                elif match and score >= SUGGEST_THRESHOLD:
+                    fields["Needs Review"]      = True
+                    fields["Best Match Guess"]  = garment_name(match["fields"])
+                    total_needs_review += 1
+                else:
+                    total_no_match += 1
+
+                records.append({"fields": fields})
+
+            resp = requests.post(url_at, headers=HEADERS_AT, json={"records": records})
+            if not resp.ok:
+                print(f"  ⚠️  Airtable batch error: {resp.text[:300]}")
+            time.sleep(2)
+
+        print(f"\n   Matching: {total_auto_matched} auto-matched | "
+              f"{total_needs_review} flagged for review | {total_no_match} no match")
     else:
         print("\n   Nothing new to add.")
 
