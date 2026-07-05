@@ -1,0 +1,35 @@
+name: Webflow Sync Stage 2b (Sightings + Publish)
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (preview only, no writes/publishes)"
+        type: boolean
+        default: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run Stage 2b
+        env:
+          AIRTABLE_API_KEY:   ${{ secrets.AIRTABLE_TOKEN }}
+          WEBFLOW_API_TOKEN:  ${{ secrets.WEBFLOW_API_TOKEN }}
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            python scripts/webflow_sync_stage2b.py --dry-run
+          else
+            python scripts/webflow_sync_stage2b.py
+          fi
