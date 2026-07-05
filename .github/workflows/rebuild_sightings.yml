@@ -11,6 +11,10 @@ on:
         description: "I understand this deletes every current Sighting item in Webflow"
         type: boolean
         default: false
+      limit:
+        description: "Limit to first N items (test mode). Leave blank for unlimited."
+        type: string
+        default: ""
 
 jobs:
   rebuild:
@@ -40,5 +44,8 @@ jobs:
           fi
           if [ "${{ inputs.confirm_wipe }}" = "true" ]; then
             FLAGS="$FLAGS --confirm-wipe"
+          fi
+          if [ -n "${{ inputs.limit }}" ]; then
+            FLAGS="$FLAGS --limit ${{ inputs.limit }}"
           fi
           python scripts/rebuild_sightings.py $FLAGS
