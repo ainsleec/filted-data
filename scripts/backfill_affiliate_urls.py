@@ -73,13 +73,24 @@ def fetch_all_sightings_with_url():
     return records
 
 
-def update_listing_url(record_id, new_url):
+def update_listing_url(record_id, new_url, max_retries=3):
     if DRY_RUN:
         print(f"  [DRY RUN] would update {record_id} -> {new_url}")
-        return
+        return True
     url = f"https://api.airtable.com/v0/{AIRTABLE_BASE}/{SIGHTINGS_TABLE}/{record_id}"
-    res = requests.patch(url, headers=HEADERS, json={"fields": {FLD_LISTING_URL: new_url}}, timeout=30)
-    res.raise_for_status()
+    for attempt in range(max_retries):
+        res = requests.patch(url, headers=HEADERS, json={"fields": {FLD_LISTING_URL: new_url}}, timeout=30)
+        if res.ok:
+            return True
+        if res.status_code == 429:
+            wait = int(res.headers.get("Retry-After", 5))
+            print(f"  Rate limited (429) on {record_id} — waiting {wait}s, retry {attempt + 1}/{max_retries}")
+            time.sleep(wait)
+            continue
+        print(f"  FAILED {record_id}: {res.status_code} {res.text[:150]}")
+        return False
+    print(f"  FAILED {record_id}: exhausted retries after repeated 429s")
+    return False
 
 
 def main():
@@ -101,13 +112,21 @@ def main():
 
     print(f"URLs needing affiliate wrapping: {len(to_update)}")
 
+    updated, failed = 0, 0
     for i, (record_id, old_url, new_url) in enumerate(to_update, 1):
-        update_listing_url(record_id, new_url)
+        ok = update_listing_url(record_id, new_url)
+        if ok:
+            updated += 1
+        else:
+            failed += 1
         if i % 100 == 0:
-            print(f"  ...{i}/{len(to_update)} updated")
-        time.sleep(0.05)  # gentle on Airtable's rate limit
+            print(f"  ...{i}/{len(to_update)} processed ({updated} updated, {failed} failed)")
+        time.sleep(0.25)  # ~4 req/sec — stays under Airtable's 5 req/sec/base cap
 
-    print(f"Done — {len(to_update)} URLs updated.")
+    print(f"Done — {updated} updated, {failed} failed (out of {len(to_update)} that needed fixing).")
+    if failed:
+        print("Re-running this script is safe — already-wrapped URLs are skipped automatically,")
+        print("so a re-run will only retry the ones that failed above.")
     print()
     print("NOTE: this script only updates Airtable. It does NOT touch Supabase's")
     print("`listings` table listing_url column. Before considering this fully done,")
