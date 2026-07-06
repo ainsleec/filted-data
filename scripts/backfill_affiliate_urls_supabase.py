@@ -87,18 +87,29 @@ def load_all_listings():
     return rows
 
 
-def update_listing_url(row_id, new_url):
+def update_listing_url(row_id, new_url, max_retries=3):
     if DRY_RUN:
         print(f"  [DRY RUN] would update listings.id={row_id} -> {new_url}")
         return True
-    res = requests.patch(
-        f"{SUPABASE_URL}/rest/v1/listings",
-        headers=headers(),
-        params={"id": f"eq.{row_id}"},
-        json={"listing_url": new_url},
-        timeout=15,
-    )
-    return res.ok
+    for attempt in range(max_retries):
+        res = requests.patch(
+            f"{SUPABASE_URL}/rest/v1/listings",
+            headers=headers(),
+            params={"id": f"eq.{row_id}"},
+            json={"listing_url": new_url},
+            timeout=15,
+        )
+        if res.ok:
+            return True
+        if res.status_code == 429 or res.status_code >= 500:
+            wait = 5 * (attempt + 1)
+            print(f"  Transient error ({res.status_code}) on {row_id} — waiting {wait}s, retry {attempt + 1}/{max_retries}")
+            time.sleep(wait)
+            continue
+        print(f"  FAILED {row_id}: {res.status_code} {res.text[:150]}")
+        return False
+    print(f"  FAILED {row_id}: exhausted retries after repeated transient errors")
+    return False
 
 
 def main():
@@ -126,7 +137,7 @@ def main():
             print(f"  FAILED to update listings.id={row_id}")
         if i % 200 == 0:
             print(f"  ...{i}/{len(to_update)} processed")
-        time.sleep(0.03)
+        time.sleep(0.08)
 
     print(f"\nDone — {updated} updated, {errors} errors.")
 
