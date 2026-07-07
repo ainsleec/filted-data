@@ -264,18 +264,43 @@ def build_slug(record_id, name_formula, fallback_name):
 
 
 # ── Webflow helpers ───────────────────────────────────────────────────────
+def webflow_request(method, url, json_body=None, max_retries=5):
+    """Shared retry-with-backoff wrapper for every real (non-dry-run)
+    Webflow API call. Handles 429 (rate limit, respects Retry-After) and
+    5xx (transient) with exponential backoff. Raises with the real
+    response body on any other failure, or after retries are exhausted.
+
+    This exists because a single uncaught 429 killed a full production
+    run twice already (once in sync_garments before this wrapper existed,
+    once in sync_campaigns which hadn't been covered yet) — every Webflow
+    write in this script should go through here from now on, not call
+    requests directly."""
+    for attempt in range(max_retries):
+        res = requests.request(method, url, headers=WEBFLOW_HEADERS, json=json_body, timeout=30)
+        if res.ok:
+            return res
+        if res.status_code == 429 or res.status_code >= 500:
+            wait = int(res.headers.get("Retry-After", 5 * (attempt + 1)))
+            print(f"  Webflow {res.status_code} on {method} {url} — waiting {wait}s, retry {attempt + 1}/{max_retries}")
+            time.sleep(wait)
+            continue
+        # Non-retryable (400, 404, etc.) — fail immediately with detail
+        raise requests.exceptions.HTTPError(
+            f"{res.status_code} on {method} {url}: {res.text[:500]} | payload: {json_body}",
+            response=res,
+        )
+    raise requests.exceptions.HTTPError(
+        f"Exhausted {max_retries} retries on {method} {url} (repeated 429/5xx): {json_body}"
+    )
+
+
 def webflow_create_item(collection_id, field_data):
     if DRY_RUN:
         fake_id = f"dryrun-{abs(hash((collection_id, field_data.get('name'), field_data.get('slug')))) % 10**8}"
         print(f"  [DRY RUN] would CREATE item in {collection_id}: {field_data}")
         return {"id": fake_id, "fieldData": field_data}
-    url = f"https://api.webflow.com/v2/collections/{collection_id}/items"
-    res = requests.post(url, headers=WEBFLOW_HEADERS, json={"fieldData": field_data}, timeout=30)
-    if not res.ok:
-        raise requests.exceptions.HTTPError(
-            f"{res.status_code} on CREATE in {collection_id}: {res.text[:500]} | payload: {field_data}",
-            response=res,
-        )
+    res = webflow_request("POST", f"https://api.webflow.com/v2/collections/{collection_id}/items",
+                           json_body={"fieldData": field_data})
     return res.json()
 
 
@@ -283,23 +308,26 @@ def webflow_update_item(collection_id, item_id, field_data):
     if DRY_RUN:
         print(f"  [DRY RUN] would UPDATE item {item_id} in {collection_id}: {field_data}")
         return {"id": item_id, "fieldData": field_data}
-    url = f"https://api.webflow.com/v2/collections/{collection_id}/items/{item_id}"
-    res = requests.patch(url, headers=WEBFLOW_HEADERS, json={"fieldData": field_data}, timeout=30)
-    if not res.ok:
-        raise requests.exceptions.HTTPError(
-            f"{res.status_code} on UPDATE {item_id} in {collection_id}: {res.text[:500]} | payload: {field_data}",
-            response=res,
-        )
+    res = webflow_request("PATCH", f"https://api.webflow.com/v2/collections/{collection_id}/items/{item_id}",
+                           json_body={"fieldData": field_data})
     return res.json()
 
 
 def webflow_get_item(collection_id, item_id):
     url = f"https://api.webflow.com/v2/collections/{collection_id}/items/{item_id}"
-    res = requests.get(url, headers=WEBFLOW_HEADERS, timeout=30)
-    if res.status_code == 404:
-        return None
-    res.raise_for_status()
-    return res.json()
+    for attempt in range(5):
+        res = requests.get(url, headers=WEBFLOW_HEADERS, timeout=30)
+        if res.status_code == 404:
+            return None
+        if res.ok:
+            return res.json()
+        if res.status_code == 429 or res.status_code >= 500:
+            wait = int(res.headers.get("Retry-After", 5 * (attempt + 1)))
+            print(f"  Webflow {res.status_code} on GET {item_id} — waiting {wait}s, retry {attempt + 1}/5")
+            time.sleep(wait)
+            continue
+        res.raise_for_status()
+    raise requests.exceptions.HTTPError(f"Exhausted retries on GET {item_id} in {collection_id}")
 
 
 def webflow_undraft_item(collection_id, item_id):
@@ -310,9 +338,8 @@ def webflow_undraft_item(collection_id, item_id):
     if DRY_RUN:
         print(f"  [DRY RUN] would un-draft item {item_id} in {collection_id}")
         return {"id": item_id, "isDraft": False}
-    url = f"https://api.webflow.com/v2/collections/{collection_id}/items/{item_id}"
-    res = requests.patch(url, headers=WEBFLOW_HEADERS, json={"isDraft": False}, timeout=30)
-    res.raise_for_status()
+    res = webflow_request("PATCH", f"https://api.webflow.com/v2/collections/{collection_id}/items/{item_id}",
+                           json_body={"isDraft": False})
     return res.json()
 
 
@@ -322,10 +349,8 @@ def webflow_site_publish():
     if DRY_RUN:
         print("  [DRY RUN] would trigger single site-wide publish")
         return {"queued": True, "dryRun": True}
-    url = f"https://api.webflow.com/v2/sites/{WEBFLOW_SITE_ID}/publish"
-    res = requests.post(url, headers=WEBFLOW_HEADERS, json={"publishToWebflowSubdomain": False}, timeout=60)
-    if not res.ok:
-        raise requests.exceptions.HTTPError(f"{res.status_code} on site publish: {res.text[:500]}", response=res)
+    res = webflow_request("POST", f"https://api.webflow.com/v2/sites/{WEBFLOW_SITE_ID}/publish",
+                           json_body={"publishToWebflowSubdomain": False})
     return res.json()
 
 
@@ -432,6 +457,7 @@ def sync_designers():
     )
 
     designer_webflow_ids = {}
+    failures = []
 
     for record in records:
         f = record["fields"]
@@ -440,29 +466,39 @@ def sync_designers():
             continue
 
         airtable_id = record["id"]
-        existing_wf_id = f.get(FLD_DESIGNER_WEBFLOW_ID)
+        try:
+            existing_wf_id = f.get(FLD_DESIGNER_WEBFLOW_ID)
 
-        field_data = {
-            WF_DESIGNER_FIELD_NAME: name,
-            WF_DESIGNER_FIELD_SLUG: slugify(name),
-        }
+            field_data = {
+                WF_DESIGNER_FIELD_NAME: name,
+                WF_DESIGNER_FIELD_SLUG: slugify(name),
+            }
 
-        if existing_wf_id:
-            existing = webflow_get_item(DESIGNERS_COLLECTION_ID, existing_wf_id)
-            if existing:
-                webflow_update_item(DESIGNERS_COLLECTION_ID, existing_wf_id, field_data)
-                designer_webflow_ids[name] = existing_wf_id
-                continue
-            # stale Webflow Item ID (deleted on Webflow side) — recreate below
+            if existing_wf_id:
+                existing = webflow_get_item(DESIGNERS_COLLECTION_ID, existing_wf_id)
+                if existing:
+                    webflow_update_item(DESIGNERS_COLLECTION_ID, existing_wf_id, field_data)
+                    designer_webflow_ids[name] = existing_wf_id
+                    continue
+                # stale Webflow Item ID (deleted on Webflow side) — recreate below
 
-        created = webflow_create_item(DESIGNERS_COLLECTION_ID, field_data)
-        new_id = created["id"]
-        airtable_update(DESIGNERS_TABLE, airtable_id, {FLD_DESIGNER_WEBFLOW_ID: new_id})
-        designer_webflow_ids[name] = new_id
-        webflow_undraft_item(DESIGNERS_COLLECTION_ID, new_id)
+            created = webflow_create_item(DESIGNERS_COLLECTION_ID, field_data)
+            new_id = created["id"]
+            airtable_update(DESIGNERS_TABLE, airtable_id, {FLD_DESIGNER_WEBFLOW_ID: new_id})
+            designer_webflow_ids[name] = new_id
+            webflow_undraft_item(DESIGNERS_COLLECTION_ID, new_id)
+
+        except Exception as e:
+            failures.append({"airtable_id": airtable_id, "name": name, "error": str(e)})
+            print(f"  FAILED designer {airtable_id} ({name}): {e}")
+
         time.sleep(0.2)
 
     print(f"Designers synced: {len(designer_webflow_ids)}")
+    if failures:
+        print(f"Designers FAILED: {len(failures)}")
+        for fail in failures:
+            print(f"  - {fail['airtable_id']} ({fail['name']}): {fail['error'][:200]}")
     return designer_webflow_ids
 
 
@@ -482,42 +518,54 @@ def sync_campaigns(qualifying_garments):
     }
 
     campaign_webflow_ids = {}  # airtable collection record id -> webflow item id
+    failures = []
 
     for airtable_id, record in campaign_records.items():
         f = record["fields"]
-        existing_wf_id = f.get(FLD_WEBFLOW_ITEM_ID)
+        collection_name = f.get("Collection Name", "")
+        try:
+            existing_wf_id = f.get(FLD_WEBFLOW_ITEM_ID)
 
-        # Airtable Lookup fields always return an array, even for a single
-        # linked value (e.g. ['Aje']) — but Webflow's Designer Name field is
-        # Plain Text, not a list. Flatten before sending, or every campaign
-        # update fails validation on a real (non-dry) run.
-        designer_raw = f.get("Designer Name") or f.get("Designer") or ""
-        designer_name = ", ".join(designer_raw) if isinstance(designer_raw, list) else designer_raw
+            # Airtable Lookup fields always return an array, even for a single
+            # linked value (e.g. ['Aje']) — but Webflow's Designer Name field is
+            # Plain Text, not a list. Flatten before sending, or every campaign
+            # update fails validation on a real (non-dry) run.
+            designer_raw = f.get("Designer Name") or f.get("Designer") or ""
+            designer_name = ", ".join(designer_raw) if isinstance(designer_raw, list) else designer_raw
 
-        field_data = {
-            WF_CAMPAIGN_FIELD_NAME: f.get("Collection Name", ""),
-            WF_CAMPAIGN_FIELD_SLUG: slugify(f.get("Collection Name", "")),
-            WF_CAMPAIGN_FIELD_AIRTABLE_ID: airtable_id,
-            WF_CAMPAIGN_FIELD_DESIGNER_NAME: designer_name,
-            WF_CAMPAIGN_FIELD_SEASON_CODE: f.get("Season Code", ""),
-        }
+            field_data = {
+                WF_CAMPAIGN_FIELD_NAME: collection_name,
+                WF_CAMPAIGN_FIELD_SLUG: slugify(collection_name),
+                WF_CAMPAIGN_FIELD_AIRTABLE_ID: airtable_id,
+                WF_CAMPAIGN_FIELD_DESIGNER_NAME: designer_name,
+                WF_CAMPAIGN_FIELD_SEASON_CODE: f.get("Season Code", ""),
+            }
 
-        if existing_wf_id:
-            existing = webflow_get_item(CAMPAIGNS_COLLECTION_ID, existing_wf_id)
-            if existing:
-                webflow_update_item(CAMPAIGNS_COLLECTION_ID, existing_wf_id, field_data)
-                campaign_webflow_ids[airtable_id] = existing_wf_id
-                continue
-            # Webflow Item ID was stale (item deleted on Webflow side) — recreate below
+            if existing_wf_id:
+                existing = webflow_get_item(CAMPAIGNS_COLLECTION_ID, existing_wf_id)
+                if existing:
+                    webflow_update_item(CAMPAIGNS_COLLECTION_ID, existing_wf_id, field_data)
+                    campaign_webflow_ids[airtable_id] = existing_wf_id
+                    continue
+                # Webflow Item ID was stale (item deleted on Webflow side) — recreate below
 
-        created = webflow_create_item(CAMPAIGNS_COLLECTION_ID, field_data)
-        new_id = created["id"]
-        airtable_update(COLLECTIONS_TABLE, airtable_id, {FLD_WEBFLOW_ITEM_ID: new_id})
-        campaign_webflow_ids[airtable_id] = new_id
-        webflow_undraft_item(CAMPAIGNS_COLLECTION_ID, new_id)
+            created = webflow_create_item(CAMPAIGNS_COLLECTION_ID, field_data)
+            new_id = created["id"]
+            airtable_update(COLLECTIONS_TABLE, airtable_id, {FLD_WEBFLOW_ITEM_ID: new_id})
+            campaign_webflow_ids[airtable_id] = new_id
+            webflow_undraft_item(CAMPAIGNS_COLLECTION_ID, new_id)
+
+        except Exception as e:
+            failures.append({"airtable_id": airtable_id, "name": collection_name, "error": str(e)})
+            print(f"  FAILED campaign {airtable_id} ({collection_name}): {e}")
+
         time.sleep(0.2)
 
     print(f"Campaigns synced: {len(campaign_webflow_ids)}")
+    if failures:
+        print(f"Campaigns FAILED: {len(failures)}")
+        for fail in failures:
+            print(f"  - {fail['airtable_id']} ({fail['name']}): {fail['error'][:200]}")
     return campaign_webflow_ids
 
 
