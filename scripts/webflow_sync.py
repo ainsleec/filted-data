@@ -114,6 +114,16 @@ WF_CAMPAIGN_FIELD_SEASON_CODE    = "season-code"
 # only the mutating calls are short-circuited.
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
 
+# Optional narrowing for faster test/dry runs — leave both unset for a
+# full production run. DESIGNER_FILTER: comma-separated designer names,
+# e.g. "Alemais" or "Alemais,Aje" — intersected with the normal In Feed
+# scope, doesn't bypass it. LIMIT: caps the number of qualifying garments
+# actually processed (useful to just eyeball a handful quickly).
+DESIGNER_FILTER = {
+    d.strip() for d in os.environ.get("DESIGNER_FILTER", "").split(",") if d.strip()
+}
+LIMIT = int(os.environ["LIMIT"]) if os.environ.get("LIMIT") else None
+
 AIRTABLE_HEADERS = {"Authorization": f"Bearer {AIRTABLE_TOKEN}"}
 WEBFLOW_HEADERS  = {
     "Authorization": f"Bearer {WEBFLOW_API_TOKEN}",
@@ -207,12 +217,24 @@ def slugify(text):
 
 
 def build_slug(record_id, name_formula, fallback_name):
-    """Single source of truth: slugify the Name (Formula) field, which
-    already includes colour where applicable. NEVER append Product Colour
-    separately here — that was the cause of the duplicated-colour bug
-    (e.g. 'valerie-broderie-shirt-ivory-ivory'). If Name (Formula) is
-    somehow blank, fall back to the raw Garment Name plus a short id
-    suffix so slugs never collide."""
+    """Single source of truth: slugify the Name (Formula) field.
+
+    Deliberately does NOT append Product Colour or Product Code
+    separately — Name (Formula) is trusted as-is, whatever it produces
+    (with colour appended when present, bare name when not — e.g. for
+    Alemais, which has no Product Colour data at all).
+
+    IMPORTANT PRE-CONDITION, verified manually before each run rather
+    than enforced in code: this assumes no two garments from the same
+    designer share an identical Garment Name where colour is also blank
+    (which would produce a genuine slug collision, since nothing else
+    would disambiguate them). Checked via an Airtable extension before
+    running — if that check ever turns up a duplicate, this function
+    will need a fallback again (e.g. Product Code) for that specific
+    case rather than reintroducing one globally.
+
+    If Name (Formula) is somehow blank, falls back to the raw Garment
+    Name plus a short id suffix so slugs never collide outright."""
     base = name_formula or fallback_name or ""
     slug = slugify(base)
     if not slug:
@@ -348,6 +370,15 @@ def get_qualifying_garments(in_feed_designers):
             qualifying.append(r)
 
     print(f"Qualifying garments (Active/Sold sighting OR Product Code, in-feed designers): {len(qualifying)}")
+
+    if DESIGNER_FILTER:
+        qualifying = [r for r in qualifying if r["fields"].get(FLD_DESIGNER) in DESIGNER_FILTER]
+        print(f"  Narrowed by DESIGNER_FILTER={sorted(DESIGNER_FILTER)}: {len(qualifying)} remain")
+
+    if LIMIT:
+        qualifying = qualifying[:LIMIT]
+        print(f"  Capped by LIMIT={LIMIT}: {len(qualifying)} will actually be processed")
+
     return qualifying
 
 
