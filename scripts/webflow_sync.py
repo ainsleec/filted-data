@@ -256,7 +256,11 @@ def webflow_create_item(collection_id, field_data):
         return {"id": fake_id, "fieldData": field_data}
     url = f"https://api.webflow.com/v2/collections/{collection_id}/items"
     res = requests.post(url, headers=WEBFLOW_HEADERS, json={"fieldData": field_data}, timeout=30)
-    res.raise_for_status()
+    if not res.ok:
+        raise requests.exceptions.HTTPError(
+            f"{res.status_code} on CREATE in {collection_id}: {res.text[:500]} | payload: {field_data}",
+            response=res,
+        )
     return res.json()
 
 
@@ -266,7 +270,11 @@ def webflow_update_item(collection_id, item_id, field_data):
         return {"id": item_id, "fieldData": field_data}
     url = f"https://api.webflow.com/v2/collections/{collection_id}/items/{item_id}"
     res = requests.patch(url, headers=WEBFLOW_HEADERS, json={"fieldData": field_data}, timeout=30)
-    res.raise_for_status()
+    if not res.ok:
+        raise requests.exceptions.HTTPError(
+            f"{res.status_code} on UPDATE {item_id} in {collection_id}: {res.text[:500]} | payload: {field_data}",
+            response=res,
+        )
     return res.json()
 
 
@@ -500,85 +508,101 @@ def sync_campaigns(qualifying_garments):
 # ── Step 5: sync Garments ─────────────────────────────────────────────────
 def sync_garments(qualifying_garments, campaign_webflow_ids, designer_webflow_ids):
     synced = []
+    failures = []
 
     for r in qualifying_garments:
         airtable_id = r["id"]
         f = r["fields"]
-
         name_formula = f.get(FLD_NAME_FORMULA, "")
         garment_name = f.get(FLD_GARMENT_NAME, "")
-        new_slug = build_slug(airtable_id, name_formula, garment_name)
+        display_name = name_formula or garment_name or "(unnamed)"
 
-        existing_wf_id = f.get(FLD_WEBFLOW_ITEM_ID)
-        existing_item = webflow_get_item(GARMENTS_COLLECTION_ID, existing_wf_id) if existing_wf_id else None
+        try:
+            new_slug = build_slug(airtable_id, name_formula, garment_name)
 
-        supabase_uuid = get_supabase_garment_uuid(airtable_id)  # may be None — see module docstring
+            existing_wf_id = f.get(FLD_WEBFLOW_ITEM_ID)
+            existing_item = webflow_get_item(GARMENTS_COLLECTION_ID, existing_wf_id) if existing_wf_id else None
 
-        campaign_wf_id = None
-        collection_links = f.get(FLD_COLLECTION) or []
-        if collection_links:
-            campaign_wf_id = campaign_webflow_ids.get(collection_links[0])
+            supabase_uuid = get_supabase_garment_uuid(airtable_id)  # may be None — see module docstring
 
-        designer_name = f.get(FLD_DESIGNER, "")
-        designer_wf_id = designer_webflow_ids.get(designer_name)
-        if designer_name and not designer_wf_id:
-            print(f"  WARNING: designer '{designer_name}' has no Webflow item — "
-                  f"garment {airtable_id} will save with no Designer reference. "
-                  f"Check spelling/whitespace match against the Designers table.")
+            campaign_wf_id = None
+            collection_links = f.get(FLD_COLLECTION) or []
+            if collection_links:
+                campaign_wf_id = campaign_webflow_ids.get(collection_links[0])
 
-        field_data = {
-            WF_FIELD_NAME: name_formula or garment_name,
-            WF_FIELD_SLUG: new_slug,
-            WF_FIELD_PRODUCT_CODE: f.get(FLD_PRODUCT_CODE, ""),
-            WF_FIELD_RRP: f.get(FLD_RRP),
-            WF_FIELD_PRODUCT_COLOUR: f.get(FLD_PRODUCT_COLOUR, ""),
-            WF_FIELD_CATEGORY: f.get(FLD_CATEGORY, ""),
-            WF_FIELD_AIRTABLE_ID: airtable_id,
-        }
-        if supabase_uuid:
-            field_data[WF_FIELD_SUPABASE_ID] = supabase_uuid
-        if campaign_wf_id:
-            field_data[WF_FIELD_CAMPAIGN_REF] = campaign_wf_id
-        if designer_wf_id:
-            field_data[WF_FIELD_DESIGNER_REF] = designer_wf_id  # single-reference — plain item ID string
+            designer_name = f.get(FLD_DESIGNER, "")
+            designer_wf_id = designer_webflow_ids.get(designer_name)
+            if designer_name and not designer_wf_id:
+                print(f"  WARNING: designer '{designer_name}' has no Webflow item — "
+                      f"garment {airtable_id} will save with no Designer reference. "
+                      f"Check spelling/whitespace match against the Designers table.")
 
-        image_url = None
-        img_field = f.get(FLD_IMAGE_1)
-        if img_field and isinstance(img_field, list) and img_field[0].get("url"):
-            image_url = img_field[0]["url"]
-            field_data[WF_FIELD_IMAGE_1] = {"url": image_url}
+            field_data = {
+                WF_FIELD_NAME: name_formula or garment_name,
+                WF_FIELD_SLUG: new_slug,
+                WF_FIELD_PRODUCT_CODE: f.get(FLD_PRODUCT_CODE, ""),
+                WF_FIELD_RRP: f.get(FLD_RRP),
+                WF_FIELD_PRODUCT_COLOUR: f.get(FLD_PRODUCT_COLOUR, ""),
+                WF_FIELD_CATEGORY: f.get(FLD_CATEGORY, ""),
+                WF_FIELD_AIRTABLE_ID: airtable_id,
+            }
+            if supabase_uuid:
+                field_data[WF_FIELD_SUPABASE_ID] = supabase_uuid
+            if campaign_wf_id:
+                field_data[WF_FIELD_CAMPAIGN_REF] = campaign_wf_id
+            if designer_wf_id:
+                field_data[WF_FIELD_DESIGNER_REF] = designer_wf_id  # single-reference — plain item ID string
 
-        if existing_item:
-            old_slug = existing_item.get("fieldData", {}).get(WF_FIELD_SLUG)
-            webflow_update_item(GARMENTS_COLLECTION_ID, existing_wf_id, field_data)
-            wf_item_id = existing_wf_id
-            if old_slug and old_slug != new_slug:
-                kv_write_redirect(old_slug, new_slug)
-                print(f"  Slug changed: {old_slug} -> {new_slug} (redirect written)")
-        else:
-            created = webflow_create_item(GARMENTS_COLLECTION_ID, field_data)
-            wf_item_id = created["id"]
-            airtable_update(GARMENTS_TABLE, airtable_id, {FLD_WEBFLOW_ITEM_ID: wf_item_id})
-            webflow_undraft_item(GARMENTS_COLLECTION_ID, wf_item_id)
+            image_url = None
+            img_field = f.get(FLD_IMAGE_1)
+            if img_field and isinstance(img_field, list) and img_field[0].get("url"):
+                image_url = img_field[0]["url"]
+                field_data[WF_FIELD_IMAGE_1] = {"url": image_url}
 
-        synced.append({
-            "airtable_id": airtable_id,
-            "webflow_item_id": wf_item_id,
-            "supabase_garment_id": supabase_uuid,
-            "name": name_formula or garment_name,
-            "slug": new_slug,
-            "product_code": f.get(FLD_PRODUCT_CODE, ""),
-            "designer": f.get(FLD_DESIGNER, ""),
-            "category": f.get(FLD_CATEGORY, ""),
-            "colour": f.get(FLD_PRODUCT_COLOUR, ""),
-            "rrp": f.get(FLD_RRP),
-            # Webflow's own asset URL — permanent, no expiry, no Supabase Storage needed
-            "image_url": image_url,
-        })
+            if existing_item:
+                old_slug = existing_item.get("fieldData", {}).get(WF_FIELD_SLUG)
+                webflow_update_item(GARMENTS_COLLECTION_ID, existing_wf_id, field_data)
+                wf_item_id = existing_wf_id
+                if old_slug and old_slug != new_slug:
+                    kv_write_redirect(old_slug, new_slug)
+                    print(f"  Slug changed: {old_slug} -> {new_slug} (redirect written)")
+            else:
+                created = webflow_create_item(GARMENTS_COLLECTION_ID, field_data)
+                wf_item_id = created["id"]
+                airtable_update(GARMENTS_TABLE, airtable_id, {FLD_WEBFLOW_ITEM_ID: wf_item_id})
+                webflow_undraft_item(GARMENTS_COLLECTION_ID, wf_item_id)
+
+            synced.append({
+                "airtable_id": airtable_id,
+                "webflow_item_id": wf_item_id,
+                "supabase_garment_id": supabase_uuid,
+                "name": name_formula or garment_name,
+                "slug": new_slug,
+                "product_code": f.get(FLD_PRODUCT_CODE, ""),
+                "designer": f.get(FLD_DESIGNER, ""),
+                "category": f.get(FLD_CATEGORY, ""),
+                "colour": f.get(FLD_PRODUCT_COLOUR, ""),
+                "rrp": f.get(FLD_RRP),
+                # Webflow's own asset URL — permanent, no expiry, no Supabase Storage needed
+                "image_url": image_url,
+            })
+
+        except Exception as e:
+            failures.append({"airtable_id": airtable_id, "name": display_name, "error": str(e)})
+            print(f"  FAILED garment {airtable_id} ({display_name}): {e}")
+            # Deliberately no re-raise — one bad record should never take
+            # down the other ~5,000+ in the same run. See failures summary
+            # at the end for what needs manual attention.
 
         time.sleep(0.15)
 
     print(f"Garments synced: {len(synced)}")
+    if failures:
+        print(f"Garments FAILED: {len(failures)}")
+        for fail in failures[:20]:
+            print(f"  - {fail['airtable_id']} ({fail['name']}): {fail['error'][:200]}")
+        if len(failures) > 20:
+            print(f"  ...and {len(failures) - 20} more")
     return synced
 
 
