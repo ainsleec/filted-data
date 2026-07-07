@@ -422,11 +422,18 @@ def sync_campaigns(qualifying_garments):
         f = record["fields"]
         existing_wf_id = f.get(FLD_WEBFLOW_ITEM_ID)
 
+        # Airtable Lookup fields always return an array, even for a single
+        # linked value (e.g. ['Aje']) — but Webflow's Designer Name field is
+        # Plain Text, not a list. Flatten before sending, or every campaign
+        # update fails validation on a real (non-dry) run.
+        designer_raw = f.get("Designer Name") or f.get("Designer") or ""
+        designer_name = ", ".join(designer_raw) if isinstance(designer_raw, list) else designer_raw
+
         field_data = {
             WF_CAMPAIGN_FIELD_NAME: f.get("Collection Name", ""),
             WF_CAMPAIGN_FIELD_SLUG: slugify(f.get("Collection Name", "")),
             WF_CAMPAIGN_FIELD_AIRTABLE_ID: airtable_id,
-            WF_CAMPAIGN_FIELD_DESIGNER_NAME: f.get("Designer Name", "") or f.get("Designer", ""),
+            WF_CAMPAIGN_FIELD_DESIGNER_NAME: designer_name,
             WF_CAMPAIGN_FIELD_SEASON_CODE: f.get("Season Code", ""),
         }
 
