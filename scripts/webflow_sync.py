@@ -12,7 +12,11 @@ Cloudflare Worker.
 
 Qualifying rule for a Garment to get a Webflow page (create-once-then-
 permanent-live — never drafted or deleted after creation):
-    has an Active or Sold sighting   OR   has a populated Product Code
+    has an Active or Sold sighting   OR   (has a populated Product Code
+    AND has an Image 1) — the image requirement only applies to the
+    Product Code path, since a page created off code alone with no photo
+    would be a thin result. Sighting history qualifies on its own
+    regardless of image, since that data is rarer/more valuable.
 
 Run order dependency: this script expects listings_sync.py to have
 already created a row in Supabase's `garments` table (with `airtable_id`
@@ -366,10 +370,16 @@ def get_qualifying_garments(in_feed_designers):
             continue
         has_sighting = r["id"] in sighted_ids
         has_code = bool((f.get(FLD_PRODUCT_CODE) or "").strip())
-        if has_sighting or has_code:
+        has_image = bool(f.get(FLD_IMAGE_1))  # Airtable attachment field: empty list/None if no image
+        # Sighting history alone qualifies regardless of image (that data's
+        # rarer/more valuable than a photo). Product Code alone is NOT
+        # enough on its own anymore — a page created off code alone with
+        # no image would be a thin, imageless result. Requiring both for
+        # that path avoids publishing pages with nothing to show.
+        if has_sighting or (has_code and has_image):
             qualifying.append(r)
 
-    print(f"Qualifying garments (Active/Sold sighting OR Product Code, in-feed designers): {len(qualifying)}")
+    print(f"Qualifying garments (Active/Sold sighting, OR Product Code + Image 1, in-feed designers): {len(qualifying)}")
 
     if DESIGNER_FILTER:
         qualifying = [r for r in qualifying if r["fields"].get(FLD_DESIGNER) in DESIGNER_FILTER]
