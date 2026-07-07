@@ -11,6 +11,14 @@ on:
         description: 'Dry run (no writes)'
         required: false
         default: 'false'
+      designer_filter:
+        description: 'Restrict to designer(s), comma-separated (blank = all in-feed)'
+        required: false
+        default: ''
+      limit:
+        description: 'Cap number of garments processed (blank = no cap)'
+        required: false
+        default: ''
 permissions:
   contents: write   # needed so the commit-back-to-repo step can push
 jobs:
@@ -38,6 +46,8 @@ jobs:
           CLOUDFLARE_KV_NAMESPACE_ID: ${{ secrets.CLOUDFLARE_KV_NAMESPACE_ID }}
           CLOUDFLARE_API_TOKEN:       ${{ secrets.CLOUDFLARE_API_TOKEN }}
           DRY_RUN:                    ${{ github.event.inputs.dry_run || 'false' }}
+          DESIGNER_FILTER:            ${{ github.event.inputs.designer_filter || '' }}
+          LIMIT:                      ${{ github.event.inputs.limit || '' }}
         run: python scripts/webflow_sync.py
 
       - name: Commit updated garments.json
