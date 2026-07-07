@@ -161,7 +161,22 @@ def airtable_fetch_all(table, filter_formula=None, fields=None):
         offset = data.get("offset")
         if not offset:
             break
-    return records
+
+    # Defensive dedup: Airtable's offset pagination can return the same
+    # record twice if that record's fields change WHILE a long fetch is
+    # still in progress (e.g. new_listings.py/listings_sync.py touching a
+    # garment mid-fetch, entirely plausible over a multi-hour run against
+    # ~6,000+ records). This caused a real duplicate Webflow item create
+    # in production — the same Airtable record processed twice from one
+    # stale in-memory fetch, both passes seeing a blank Webflow Item ID.
+    seen = {}
+    for r in records:
+        seen[r["id"]] = r  # last occurrence wins; fields should be identical either way
+    deduped = list(seen.values())
+    if len(deduped) != len(records):
+        print(f"  NOTE: {table} fetch returned {len(records)} rows, "
+              f"{len(records) - len(deduped)} duplicate(s) removed (pagination artifact)")
+    return deduped
 
 
 def airtable_update(table, record_id, fields):
@@ -309,7 +324,8 @@ def webflow_site_publish():
         return {"queued": True, "dryRun": True}
     url = f"https://api.webflow.com/v2/sites/{WEBFLOW_SITE_ID}/publish"
     res = requests.post(url, headers=WEBFLOW_HEADERS, json={"publishToWebflowSubdomain": False}, timeout=60)
-    res.raise_for_status()
+    if not res.ok:
+        raise requests.exceptions.HTTPError(f"{res.status_code} on site publish: {res.text[:500]}", response=res)
     return res.json()
 
 
@@ -657,8 +673,19 @@ def main():
     designer_webflow_ids = sync_designers()
     synced_garments = sync_garments(qualifying_garments, campaign_webflow_ids, designer_webflow_ids)
 
-    publish_site()
+    # Export garments.json FIRST — this data is valuable on its own and
+    # shouldn't be held hostage by an unrelated publish failure (which is
+    # exactly what happened on a previous run: publish crashed, and the
+    # json export — the very last line of the script — never ran at all,
+    # despite ~5,478 garments having synced successfully beforehand).
     export_garments_json(synced_garments)
+
+    try:
+        publish_site()
+    except Exception as e:
+        print(f"WARNING: site publish failed, but garments.json was already exported successfully: {e}")
+        print("Garments/Campaigns/Designers were still created/updated in Webflow — they just haven't")
+        print("been published live yet. Re-run publish manually, or it'll retry on the next scheduled sync.")
 
     print("=== webflow_sync.py — done ===")
 
