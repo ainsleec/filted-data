@@ -149,10 +149,12 @@ def main():
 
     print(f"\nDeleting {len(webflow_items)} Webflow items...")
     deleted, delete_errors = 0, 0
+    successfully_deleted_ids = set()
     for i, item in enumerate(webflow_items, 1):
         try:
             delete_webflow_item(item["id"])
             deleted += 1
+            successfully_deleted_ids.add(item["id"])
         except Exception as e:
             delete_errors += 1
             print(f"  FAILED to delete {item['id']}: {e}")
@@ -160,20 +162,44 @@ def main():
             print(f"  ...{i}/{len(webflow_items)} processed")
         time.sleep(0.15)
 
-    print(f"\nClearing Webflow Item ID on {len(airtable_records)} Airtable records...")
+    # Only clear the Airtable link for records whose Webflow item was
+    # ACTUALLY deleted. Clearing it unconditionally (the original bug)
+    # would orphan-in-reverse: for any item that failed to delete (e.g.
+    # a 409 conflict because Resale Sightings still references it), the
+    # Webflow item still genuinely exists, but Airtable would think it
+    # doesn't — and webflow_sync.py would then create a brand new
+    # duplicate for it, recreating the exact problem this wipe exists to
+    # fix.
+    records_to_clear = [
+        r for r in airtable_records
+        if r["fields"].get(FLD_WEBFLOW_ITEM_ID) in successfully_deleted_ids
+    ]
+    skipped_still_linked = len(airtable_records) - len(records_to_clear)
+
+    print(f"\nClearing Webflow Item ID on {len(records_to_clear)} Airtable records "
+          f"(successfully deleted only)...")
+    if skipped_still_linked:
+        print(f"  {skipped_still_linked} records LEFT LINKED because their Webflow item failed to "
+              f"delete — these still genuinely exist in Webflow and must not be treated as gone.")
+
     cleared = 0
-    for i, record in enumerate(airtable_records, 1):
+    for i, record in enumerate(records_to_clear, 1):
         clear_airtable_webflow_id(record["id"])
         cleared += 1
         if i % 200 == 0:
-            print(f"  ...{i}/{len(airtable_records)} processed")
+            print(f"  ...{i}/{len(records_to_clear)} processed")
         time.sleep(0.25)  # stay under Airtable's 5 req/sec cap
 
     print(f"\nDone — {deleted} Webflow items deleted ({delete_errors} errors), "
-          f"{cleared} Airtable links cleared.")
+          f"{cleared} Airtable links cleared, {skipped_still_linked} left linked (delete failed).")
     if DRY_RUN:
         print("This was a dry run — nothing was actually deleted or changed. Set DRY_RUN=false to apply.")
     else:
+        if delete_errors:
+            print(f"\n{delete_errors} items could not be deleted — almost certainly still referenced by")
+            print("Resale Sightings. These need Sightings dealt with first before a re-run of this")
+            print("script can fully clear them. Do NOT run webflow_sync.py yet if a large number of")
+            print("items are still undeleted — it will only recreate what's missing, not fix the mix.")
         print("\nNext step: run webflow_sync.py for real to recreate everything from Airtable.")
         print("After that completes, diff new slugs against current_slugs_snapshot.csv and write redirects.")
 
