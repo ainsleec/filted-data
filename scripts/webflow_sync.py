@@ -544,7 +544,7 @@ def sync_campaigns(qualifying_garments):
 
             field_data = {
                 WF_CAMPAIGN_FIELD_NAME: collection_name,
-                WF_CAMPAIGN_FIELD_SLUG: slugify(collection_name),
+                WF_CAMPAIGN_FIELD_SLUG: slugify(f"{designer_name} {collection_name}"),
                 WF_CAMPAIGN_FIELD_AIRTABLE_ID: airtable_id,
                 WF_CAMPAIGN_FIELD_DESIGNER_NAME: designer_name,
                 WF_CAMPAIGN_FIELD_SEASON_CODE: f.get("Season Code", ""),
