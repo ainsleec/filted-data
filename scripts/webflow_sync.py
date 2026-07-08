@@ -82,6 +82,11 @@ SIGHTINGS_TABLE  = "Resale Sightings"
 FLD_DESIGNER_NAME       = "Designer Name"
 FLD_DESIGNER_WEBFLOW_ID = "Webflow Item ID"  # same field name as on Garments/Collections tables
 
+# Base path for campaign pages — CONFIRMED via the live Webflow preview
+# URL (www.filted.com.au/collections/{slug}) on Jul 2026. NOT /campaigns/
+# despite the collection being called "Campaigns" in Webflow's CMS.
+CAMPAIGN_URL_PREFIX = "/collections/"
+
 # Webflow CMS field slugs — CONFIRMED via GET /v2/collections/{id} on the
 # real site (not guessed). If any of these ever look wrong again, re-run
 # the diagnostic in the same way rather than assuming.
@@ -202,12 +207,16 @@ def get_supabase_garment_uuid(airtable_id):
 
 
 # ── Cloudflare KV helper (redirects) ─────────────────────────────────────
-def kv_write_redirect(old_slug, new_slug):
-    """Writes redirect:/garments/{old_slug} -> /garments/{new_slug} so any
-    already-indexed/bookmarked URL 301s instead of 404ing. Uses the same
-    key scheme worker.js already reads on every /garments/* request."""
-    key = f"redirect:/garments/{old_slug}"
-    value = f"/garments/{new_slug}"
+def kv_write_redirect(old_slug, new_slug, path_prefix="/garments/"):
+    """Writes redirect:{path_prefix}{old_slug} -> {path_prefix}{new_slug} so
+    any already-indexed/bookmarked URL 301s instead of 404ing. Defaults to
+    /garments/ (what worker.js currently handles) — pass a different
+    path_prefix for other collections, but note: worker.js's redirect
+    logic must ALSO be extended to check that prefix, or a redirect
+    written here will simply never be looked up. As of this writing,
+    worker.js only checks paths starting with /garments/."""
+    key = f"redirect:{path_prefix}{old_slug}"
+    value = f"{path_prefix}{new_slug}"
     if DRY_RUN:
         print(f"  [DRY RUN] would write KV redirect: {key} -> {value}")
         return
@@ -544,8 +553,13 @@ def sync_campaigns(qualifying_garments):
             if existing_wf_id:
                 existing = webflow_get_item(CAMPAIGNS_COLLECTION_ID, existing_wf_id)
                 if existing:
+                    old_slug = existing.get("fieldData", {}).get(WF_CAMPAIGN_FIELD_SLUG)
+                    new_slug = field_data[WF_CAMPAIGN_FIELD_SLUG]
                     webflow_update_item(CAMPAIGNS_COLLECTION_ID, existing_wf_id, field_data)
                     campaign_webflow_ids[airtable_id] = existing_wf_id
+                    if old_slug and old_slug != new_slug:
+                        kv_write_redirect(old_slug, new_slug, path_prefix=CAMPAIGN_URL_PREFIX)
+                        print(f"  Campaign slug changed: {old_slug} -> {new_slug} (redirect written)")
                     continue
                 # Webflow Item ID was stale (item deleted on Webflow side) — recreate below
 
