@@ -1,10 +1,10 @@
 name: Webflow Sync
 on:
   #schedule:
-   # - cron: '10 22 * * *'     # 8am AEST (10pm UTC prev day)
-    #- cron: '10 2 * * *'      # 12pm AEST (2am UTC)
-    #- cron: '10 7 * * *'      # 5pm AEST (7am UTC)
-    #- cron: '10 11 * * *'     # 9pm AEST (11am UTC)
+    # - cron: '10 22 * * *'     # 8am AEST (10pm UTC prev day)
+    # - cron: '10 2 * * *'      # 12pm AEST (2am UTC)
+    # - cron: '10 7 * * *'      # 5pm AEST (7am UTC)
+    # - cron: '10 11 * * *'     # 9pm AEST (11am UTC)
   workflow_dispatch:
     inputs:
       dry_run:
@@ -19,6 +19,10 @@ on:
         description: 'Cap number of garments processed (blank = no cap)'
         required: false
         default: ''
+      sighted_only:
+        description: 'Only process garments with an active/sold sighting right now (for testing Active Listings with real data)'
+        required: false
+        default: 'false'
 permissions:
   contents: write   # needed so the commit-back-to-repo step can push
 jobs:
@@ -48,6 +52,7 @@ jobs:
           DRY_RUN:                    ${{ github.event.inputs.dry_run || 'false' }}
           DESIGNER_FILTER:            ${{ github.event.inputs.designer_filter || '' }}
           LIMIT:                      ${{ github.event.inputs.limit || '' }}
+          SIGHTED_ONLY:               ${{ github.event.inputs.sighted_only || 'false' }}
         run: python scripts/webflow_sync.py
 
       - name: Commit updated garments.json
