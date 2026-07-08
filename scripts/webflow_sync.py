@@ -360,12 +360,30 @@ def webflow_undraft_item(collection_id, item_id):
 
 def webflow_site_publish():
     """ONE single site-wide publish call at the very end of the run —
-    not per-item, not per-collection batch."""
+    not per-item, not per-collection batch.
+
+    Webflow's v2 publish endpoint requires an explicit list of custom
+    domain IDs to publish to — publishToWebflowSubdomain:False alone
+    (with no customDomains) gives it zero valid targets and fails with
+    'You must pass at least one valid domain id'. Fetch the site's real
+    domain IDs first rather than guessing."""
     if DRY_RUN:
         print("  [DRY RUN] would trigger single site-wide publish")
         return {"queued": True, "dryRun": True}
+
+    site_res = webflow_request("GET", f"https://api.webflow.com/v2/sites/{WEBFLOW_SITE_ID}")
+    site_data = site_res.json()
+    custom_domain_ids = [d["id"] for d in site_data.get("customDomains", [])]
+
+    if not custom_domain_ids:
+        print("  WARNING: no custom domains found on this site — falling back to "
+              "publishToWebflowSubdomain:True so at least the staging domain publishes.")
+        payload = {"publishToWebflowSubdomain": True}
+    else:
+        payload = {"customDomains": custom_domain_ids, "publishToWebflowSubdomain": False}
+
     res = webflow_request("POST", f"https://api.webflow.com/v2/sites/{WEBFLOW_SITE_ID}/publish",
-                           json_body={"publishToWebflowSubdomain": False})
+                           json_body=payload)
     return res.json()
 
 
