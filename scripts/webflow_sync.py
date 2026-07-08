@@ -133,6 +133,12 @@ DESIGNER_FILTER = {
 }
 LIMIT = int(os.environ["LIMIT"]) if os.environ.get("LIMIT") else None
 
+# SIGHTED_ONLY=true restricts the qualifying set to garments that have an
+# Active/Sold sighting right now — useful for a small test batch aimed at
+# actually exercising the Active Listings widget with real, non-empty
+# data, rather than only ever landing on garments with nothing listed.
+SIGHTED_ONLY = os.environ.get("SIGHTED_ONLY", "false").lower() == "true"
+
 AIRTABLE_HEADERS = {"Authorization": f"Bearer {AIRTABLE_TOKEN}"}
 WEBFLOW_HEADERS  = {
     "Authorization": f"Bearer {WEBFLOW_API_TOKEN}",
@@ -438,6 +444,10 @@ def get_qualifying_garments(in_feed_designers):
             qualifying.append(r)
 
     print(f"Qualifying garments (Active/Sold sighting, OR Product Code + Image 1, in-feed designers): {len(qualifying)}")
+
+    if SIGHTED_ONLY:
+        qualifying = [r for r in qualifying if r["id"] in sighted_ids]
+        print(f"  Narrowed by SIGHTED_ONLY: {len(qualifying)} remain")
 
     if DESIGNER_FILTER:
         qualifying = [r for r in qualifying if r["fields"].get(FLD_DESIGNER) in DESIGNER_FILTER]
