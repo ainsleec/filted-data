@@ -19,6 +19,12 @@ generates or guesses a slug itself.
 Run with DRY_RUN=true first (default) to see what would change without
 writing anything. Set DRY_RUN=false to actually patch Supabase.
 
+Resumable: if a run times out partway through, re-run with OFFSET set to
+however many rows were already processed (visible in the "...processed
+X/Y" log lines) to continue rather than starting over. The report file
+is also written progressively, not just at the end, so a timeout doesn't
+lose the findings gathered so far.
+
 Requires the same env vars as webflow_sync.py: SUPABASE_URL,
 SUPABASE_ANON_KEY (or a service-role key if RLS blocks anon writes),
 WEBFLOW_API_TOKEN.
@@ -36,6 +42,12 @@ WEBFLOW_API_TOKEN = os.environ["WEBFLOW_API_TOKEN"]
 GARMENTS_COLLECTION_ID = "68774f3e850c7a30ebc3a0aa"
 
 DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+# For resumable batching if a run times out mid-way — process a slice
+# instead of everything at once, then re-run with a higher OFFSET to
+# continue where it left off. Leave both unset for a full single run.
+LIMIT  = int(os.environ["LIMIT"])  if os.environ.get("LIMIT")  else None
+OFFSET = int(os.environ["OFFSET"]) if os.environ.get("OFFSET") else 0
 
 SUPABASE_HEADERS = {
     "apikey": SUPABASE_KEY,
@@ -99,13 +111,26 @@ def supabase_update_slug(row_id, new_slug):
     return True
 
 
+def write_report(report):
+    with open(REPORT_PATH, "w") as fp:
+        json.dump(report, fp, indent=2)
+
+
 def main():
     print("=== backfill_supabase_slugs.py — starting ===")
     if DRY_RUN:
         print("*** DRY RUN MODE — no Supabase writes will actually happen ***")
 
-    rows = supabase_fetch_all_garments()
-    print(f"Fetched {len(rows)} Supabase garments rows with a webflow_item_id")
+    all_rows = supabase_fetch_all_garments()
+    print(f"Fetched {len(all_rows)} total Supabase garments rows with a webflow_item_id")
+
+    rows = all_rows[OFFSET:]
+    if LIMIT:
+        rows = rows[:LIMIT]
+    print(f"Processing rows {OFFSET} to {OFFSET + len(rows)} of {len(all_rows)} "
+          f"(OFFSET={OFFSET}, LIMIT={LIMIT or 'none'})")
+    if OFFSET or LIMIT:
+        print(f"  If this run gets cut off, resume with OFFSET={OFFSET + len(rows)} next time.")
 
     changes = []
     missing_webflow = []
@@ -151,28 +176,49 @@ def main():
             unchanged += 1
 
         if i % 200 == 0:
-            print(f"  ...processed {i}/{len(rows)}")
+            print(f"  ...processed {i}/{len(rows)} (this batch) — writing progress checkpoint")
+            write_report({
+                "dry_run": DRY_RUN,
+                "offset": OFFSET,
+                "in_progress": True,
+                "processed_so_far": i,
+                "batch_size": len(rows),
+                "unchanged": unchanged,
+                "changes": changes,
+                "missing_webflow_items": missing_webflow,
+                "failures": failures,
+            })
 
         time.sleep(0.1)  # gentle on Webflow's rate limit
 
-    print("\n=== Summary ===")
-    print(f"Total rows checked:      {len(rows)}")
+    print("\n=== Summary (this batch) ===")
+    print(f"Rows checked this run:   {len(rows)}")
     print(f"Already correct:         {unchanged}")
     print(f"Slug mismatches found:   {len(changes)}")
     print(f"Webflow item missing:    {len(missing_webflow)}")
     print(f"Failures:                {len(failures)}")
 
+    final_offset = OFFSET + len(rows)
+    remaining = len(all_rows) - final_offset
+
     report = {
         "dry_run": DRY_RUN,
-        "total_checked": len(rows),
+        "offset": OFFSET,
+        "in_progress": False,
+        "total_rows_overall": len(all_rows),
+        "rows_checked_this_batch": len(rows),
         "unchanged": unchanged,
         "changes": changes,
         "missing_webflow_items": missing_webflow,
         "failures": failures,
+        "remaining_rows": remaining,
+        "next_offset_if_continuing": final_offset if remaining > 0 else None,
     }
-    with open(REPORT_PATH, "w") as fp:
-        json.dump(report, fp, indent=2)
+    write_report(report)
     print(f"\nFull report written to {REPORT_PATH}")
+
+    if remaining > 0:
+        print(f"\n{remaining} rows not yet checked. Re-run with OFFSET={final_offset} to continue.")
 
     if DRY_RUN:
         print("\nThis was a DRY RUN — no Supabase rows were actually changed.")
