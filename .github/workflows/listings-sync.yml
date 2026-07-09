@@ -1,10 +1,10 @@
 name: Listings Sync (Airtable → Supabase)
 
 on:
-  schedule:
+  #schedule:
     # Runs daily at 02:15 UTC — after expiry_checker.py's typical run,
     # so newly-expired listings and their statuses are already settled.
-    - cron: "15 2 * * *"
+    #- cron: "15 2 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
