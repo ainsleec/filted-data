@@ -212,6 +212,26 @@ def get_supabase_garment_uuid(airtable_id):
     return rows[0]["id"] if rows else None
 
 
+def update_supabase_garment_slug(supabase_uuid, slug):
+    """Keeps Supabase's garments.slug in sync with Webflow's real slug on
+    every run — this is the actual fix for the drift that required
+    backfill_supabase_slugs.py in the first place. Supabase's slug was
+    seeded once (2026-06-10) and never updated since because nothing
+    wrote back to it; the worker's /campaigns/:slug endpoint reads this
+    column directly to build garment links on campaign pages, so letting
+    it go stale again would silently reintroduce the same 404s. Best
+    effort — a failure here logs a warning but doesn't fail the whole
+    garment sync, since Webflow itself (the source of truth) is already
+    correctly updated regardless."""
+    if DRY_RUN:
+        print(f"  [DRY RUN] would update Supabase garments.slug for {supabase_uuid} -> {slug}")
+        return
+    url = f"{SUPABASE_URL}/rest/v1/garments?id=eq.{supabase_uuid}"
+    res = requests.patch(url, headers=SUPABASE_HEADERS, json={"slug": slug}, timeout=15)
+    if not res.ok:
+        print(f"  WARNING: failed to update Supabase slug for {supabase_uuid}: {res.status_code} {res.text[:200]}")
+
+
 # ── Cloudflare KV helper (redirects) ─────────────────────────────────────
 def kv_write_redirect(old_slug, new_slug, path_prefix="/garments/"):
     """Writes redirect:{path_prefix}{old_slug} -> {path_prefix}{new_slug} so
@@ -630,6 +650,8 @@ def sync_garments(qualifying_garments, campaign_webflow_ids, designer_webflow_id
             existing_item = webflow_get_item(GARMENTS_COLLECTION_ID, existing_wf_id) if existing_wf_id else None
 
             supabase_uuid = get_supabase_garment_uuid(airtable_id)  # may be None — see module docstring
+            if supabase_uuid:
+                update_supabase_garment_slug(supabase_uuid, new_slug)
 
             campaign_wf_id = None
             collection_links = f.get(FLD_COLLECTION) or []
