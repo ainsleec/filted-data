@@ -6,7 +6,7 @@ Checks 2000 Active sightings per run against eBay Browse API.
 Updates status to Expired in Airtable and stamps ended_at in Supabase.
 """
 
-import os, re, requests, time, base64
+import os, re, json, requests, time, base64
 from datetime import datetime, timezone, timedelta
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -28,6 +28,8 @@ HEADERS_AT = {
     "Authorization": f"Bearer {AIRTABLE_TOKEN}",
     "Content-Type":  "application/json"
 }
+
+UNMATCHED_REPORT_PATH = "expiry_checker_unmatched.json"
 
 
 # ── Supabase helpers ──────────────────────────────────────────────────────────
@@ -77,15 +79,23 @@ def load_supabase_active_listings():
 
 
 def mark_listings_ended(listing_ids, reason):
-    """Batch mark multiple listings as ended in one Supabase call per batch."""
+    """Batch mark multiple listings as ended in one Supabase call per batch.
+
+    Now checks the response and reports failures — previously this fired
+    the PATCH and never looked at whether it actually succeeded, so a
+    failed write (rate limit, malformed filter, transient network issue)
+    would silently vanish with the run still showing green."""
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY or not listing_ids:
-        return
+        return 0, 0
+
     now = datetime.now(timezone.utc).isoformat()
+    succeeded, failed = 0, 0
+
     # Supabase doesn't support bulk patch by id list easily, do in small batches
     for i in range(0, len(listing_ids), 50):
         batch = listing_ids[i:i+50]
         id_list = ",".join(batch)
-        requests.patch(
+        resp = requests.patch(
             f"{SUPABASE_URL}/rest/v1/listings",
             headers=get_supabase_headers(),
             params={
@@ -95,6 +105,14 @@ def mark_listings_ended(listing_ids, reason):
             json={"ended_at": now, "ended_reason": reason},
             timeout=15,
         )
+        if resp.ok:
+            succeeded += len(batch)
+        else:
+            failed += len(batch)
+            print(f"   ⚠️  Supabase batch mark-ended FAILED for {len(batch)} rows: "
+                  f"{resp.status_code} {resp.text[:200]}")
+
+    return succeeded, failed
 
 
 # ── eBay OAuth token ──────────────────────────────────────────────────────────
@@ -275,6 +293,7 @@ def main():
     ended_ids        = []
     ended_sb_ids     = []
     still_active_ids = []
+    unmatched        = []  # Airtable sightings that expired but had no matching Supabase row
 
     for i, rec in enumerate(to_check):
         status = check_listing_status(rec["item_id"], ebay_headers)
@@ -286,6 +305,7 @@ def main():
                 ended_sb_ids.append(sb_id)
             else:
                 print(f"   ⚠️  No Supabase match for item_id={rec['item_id']!r} (Airtable rec {rec['id']})")
+                unmatched.append({"airtable_record_id": rec["id"], "ebay_item_id": rec["item_id"]})
         else:
             still_active_ids.append(rec["id"])
 
@@ -296,9 +316,32 @@ def main():
     print(f"\n   Expired: {len(ended_ids)} | Still active: {len(still_active_ids)}")
 
     # Batch mark ended in Supabase
+    sb_succeeded, sb_failed = 0, 0
     if ended_sb_ids:
         print(f"\n📊 Marking {len(ended_sb_ids)} listings ended in Supabase...")
-        mark_listings_ended(ended_sb_ids, "expired")
+        sb_succeeded, sb_failed = mark_listings_ended(ended_sb_ids, "expired")
+        print(f"   {sb_succeeded} succeeded | {sb_failed} FAILED")
+
+    # Write unmatched report — these are Airtable sightings correctly marked
+    # Expired, but with NO corresponding Supabase row to close out, meaning
+    # Supabase still shows them as active indefinitely until something else
+    # creates or reconciles that missing row. This was previously only a
+    # console print, easy to miss across a 24-minute log with thousands of
+    # lines — now it's a real artifact you can check without re-reading logs.
+    if unmatched:
+        with open(UNMATCHED_REPORT_PATH, "w") as fp:
+            json.dump({
+                "run_date": run_start.isoformat(),
+                "count": len(unmatched),
+                "unmatched": unmatched,
+                "note": ("These Airtable sightings expired on eBay but had no matching "
+                         "Supabase listings row (by ebay_item_id) to mark ended. Likely "
+                         "cause: listings_sync.py never created a row for these in the "
+                         "first place. Supabase will keep showing these as active until "
+                         "a reconciliation pass creates the missing rows or manually "
+                         "closes them out."),
+            }, fp, indent=2)
+        print(f"\n⚠️  {len(unmatched)} unmatched — written to {UNMATCHED_REPORT_PATH}")
 
     print(f"\n📝 Applying updates to Airtable...")
     total_updated, err_count = push_updates(ended_ids, still_active_ids)
