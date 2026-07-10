@@ -61,5 +61,26 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add garments.json
-          git diff --cached --quiet || git commit -m "Update garments.json [automated]"
-          git push
+          git diff --cached --quiet && exit 0   # nothing changed, nothing to push
+
+          git commit -m "Update garments.json [automated]"
+
+          # This run can take ~3 hours — other workflows (backfills, other
+          # syncs) may well push to main while it's running. A plain
+          # `git push` would then fail outright and the whole garments.json
+          # update would be lost even though the real Webflow/Airtable/
+          # Supabase writes already succeeded independently of this step.
+          # Retry with a rebase against the latest main a few times before
+          # actually giving up.
+          for attempt in 1 2 3 4 5; do
+            if git push; then
+              echo "Push succeeded on attempt $attempt"
+              exit 0
+            fi
+            echo "Push failed (attempt $attempt) — fetching and rebasing onto latest main..."
+            git fetch origin main
+            git rebase origin/main || { echo "Rebase conflict — manual resolution needed"; exit 1; }
+            sleep 5
+          done
+          echo "Push still failing after 5 attempts — giving up. garments.json commit exists locally in this run's log but was NOT pushed."
+          exit 1
