@@ -1,1 +1,45 @@
+name: Listings Sync + Expiry Check
+on:
+  schedule:
+    - cron: '25 13 * * *'   # ~11:25pm AEST once daily — after new_listings.py has run
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (no writes)'
+        required: false
+        default: 'false'
+jobs:
+  sync_and_check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run listings sync + expiry check
+        env:
+          AIRTABLE_TOKEN:         ${{ secrets.AIRTABLE_TOKEN }}
+          AIRTABLE_BASE:          ${{ secrets.AIRTABLE_BASE }}
+          RESALE_SIGHTINGS_TABLE: ${{ secrets.RESALE_SIGHTINGS_TABLE }}
+          EBAY_CLIENT_ID:         ${{ secrets.EBAY_CLIENT_ID }}
+          EBAY_CLIENT_SECRET:     ${{ secrets.EBAY_CLIENT_SECRET }}
+          SUPABASE_URL:           ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY:   ${{ secrets.SUPABASE_SERVICE_KEY }}
+          DRY_RUN:                ${{ github.event.inputs.dry_run || 'false' }}
+        run: python scripts/listings_sync_and_expiry.py
+
+      - name: Upload unmatched report (if any)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: expiry-checker-unmatched
+          path: expiry_checker_unmatched.json
+          if-no-files-found: ignore
