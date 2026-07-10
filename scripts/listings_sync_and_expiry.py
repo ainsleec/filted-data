@@ -379,12 +379,19 @@ def run_expiry_check_phase():
     ebay_headers = {"Authorization": f"Bearer {ebay_token}", "X-EBAY-C-MARKETPLACE-ID": "EBAY_AU"}
 
     print("\n📊 Loading active listings from Supabase...")
-    sb_listings = {}
-    rows = load_all_supabase_rows("listings", "id,ebay_item_id", extra_params={"ended_at": "is.null"})
+    sb_active = {}
+    sb_all_ever = set()  # every ebay_item_id that has ANY Supabase row, active or already-ended
+    rows = load_all_supabase_rows("listings", "id,ebay_item_id,ended_at")
     for r in rows:
-        if r.get("ebay_item_id"):
-            sb_listings[str(r["ebay_item_id"])] = r["id"]
-    print(f"   {len(sb_listings)} active listings loaded")
+        eid = r.get("ebay_item_id")
+        if not eid:
+            continue
+        eid = str(eid)
+        sb_all_ever.add(eid)
+        if r.get("ended_at") is None:
+            sb_active[eid] = r["id"]
+    sb_listings = sb_active
+    print(f"   {len(sb_active)} active listings loaded ({len(sb_all_ever)} total rows including already-ended)")
 
     print("\n📦 Loading active sightings from Airtable...")
     recheck_cutoff = (datetime.now(timezone.utc) - timedelta(days=RECHECK_DAYS)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
@@ -432,14 +439,20 @@ def run_expiry_check_phase():
             sb_id = sb_listings.get(rec["item_id"])
             if sb_id:
                 ended_sb_ids.append(sb_id)
+            elif rec["item_id"] in sb_all_ever:
+                # A Supabase row DOES exist for this — it was just already
+                # closed out at some point before this run (ended_at
+                # already set). Airtable's Status field was simply stale
+                # until now; this run's push_updates below correctly
+                # fixes that. Nothing actually missing, no action needed.
+                print(f"   ℹ️  {rec['item_id']!r} already closed out in Supabase previously "
+                      f"— Airtable Status was just stale, now corrected (Airtable rec {rec['id']})")
             else:
-                # Should be rare now — Phase 1 just ran and would have
-                # created a row for this sighting if it didn't exist.
-                # If this still fires, something else is wrong (e.g. the
-                # eBay Item ID itself doesn't match between the two
-                # systems) rather than the original sync-gap bug.
+                # Genuinely no Supabase row at all, even after Phase 1 —
+                # this is the real, still-unexplained gap worth digging
+                # into (e.g. an eBay Item ID mismatch between systems).
                 print(f"   ⚠️  No Supabase match for item_id={rec['item_id']!r} "
-                      f"(Airtable rec {rec['id']}) — unexpected after Phase 1, worth investigating")
+                      f"(Airtable rec {rec['id']}) — genuinely never existed, worth investigating")
                 unmatched.append({"airtable_record_id": rec["id"], "ebay_item_id": rec["item_id"]})
         else:
             still_active_ids.append(rec["id"])
