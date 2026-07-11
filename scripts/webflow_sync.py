@@ -470,18 +470,20 @@ def get_qualifying_garments(in_feed_designers):
         designer = f.get(FLD_DESIGNER)
         if designer not in in_feed_designers:
             continue
-        has_sighting = r["id"] in sighted_ids
-        has_code = bool((f.get(FLD_PRODUCT_CODE) or "").strip())
+        has_collection = bool(f.get(FLD_COLLECTION))  # linked record field — empty list/None if unset
         has_image = bool(f.get(FLD_IMAGE_1))  # Airtable attachment field: empty list/None if no image
-        # Sighting history alone qualifies regardless of image (that data's
-        # rarer/more valuable than a photo). Product Code alone is NOT
-        # enough on its own anymore — a page created off code alone with
-        # no image would be a thin, imageless result. Requiring both for
-        # that path avoids publishing pages with nothing to show.
-        if has_sighting or (has_code and has_image):
+        # Deliberately simple, unconditional rule: Collection assigned AND
+        # Image 1 present. No exceptions (sighting history alone used to
+        # qualify a garment even without an image — that's gone). This is
+        # intentional: it exactly matches the campaign table's own
+        # row-inclusion criteria (see worker.js's /garments endpoint),
+        # guaranteeing that anything ever shown in a campaign table is
+        # guaranteed to have a real page behind it — no more silent
+        # mismatches between "shown as a row" and "actually clickable."
+        if has_collection and has_image:
             qualifying.append(r)
 
-    print(f"Qualifying garments (Active/Sold sighting, OR Product Code + Image 1, in-feed designers): {len(qualifying)}")
+    print(f"Qualifying garments (Collection assigned AND Image 1, in-feed designers): {len(qualifying)}")
 
     if SIGHTED_ONLY:
         qualifying = [r for r in qualifying if r["id"] in sighted_ids]
