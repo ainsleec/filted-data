@@ -122,6 +122,38 @@ def load_all_airtable_sightings(fields, filter_formula=None):
 # for a sighting of ANY status (not just Active/Sold).
 # ══════════════════════════════════════════════════════════════════════════
 
+def reconcile_stale_listings(items):
+    """Patch existing Supabase rows that are still open (ended_at null)
+    despite Airtable already showing them Sold/Expired. One request per
+    row rather than batching — these are individually distinct patches
+    (different sold_price/sold_at per row), unlike mark_listings_ended's
+    uniform batch update."""
+    now = datetime.now(timezone.utc).isoformat()
+    succeeded, failed = 0, 0
+
+    for item in items:
+        patch = {"ended_at": now, "ended_reason": item["reason"]}
+        if item["reason"] == "sold":
+            patch["sold_price"] = item["sold_price"]
+            patch["sold_at"] = item["sold_at"] or now
+
+        resp = requests.patch(
+            f"{SUPABASE_URL}/rest/v1/listings",
+            headers=get_supabase_headers(),
+            params={"id": f"eq.{item['supabase_id']}"},
+            json=patch,
+            timeout=15,
+        )
+        if resp.ok:
+            succeeded += 1
+        else:
+            failed += 1
+            print(f"   ⚠️  Reconcile FAILED for {item['supabase_id']}: {resp.status_code} {resp.text[:150]}")
+        time.sleep(0.05)
+
+    return succeeded, failed
+
+
 def insert_listings(rows):
     """Bulk insert in batches of 50. On batch failure, retry rows individually
     so one bad row doesn't sink the other 49 good ones."""
@@ -161,10 +193,15 @@ def run_sync_phase():
     print("PHASE 1 — Sync (Airtable → Supabase, any status)")
     print("═" * 60)
 
-    print("📊 Loading existing Supabase listings (for dedup)...")
-    existing_listings = load_all_supabase_rows("listings", "ebay_item_id,airtable_id")
+    print("📊 Loading existing Supabase listings (for dedup + reconciliation)...")
+    existing_listings = load_all_supabase_rows("listings", "id,ebay_item_id,airtable_id,ended_at")
     existing_ids = {str(r["ebay_item_id"]) for r in existing_listings if r.get("ebay_item_id")}
     existing_airtable_ids = {r["airtable_id"] for r in existing_listings if r.get("airtable_id")}
+    # For reconciliation: existing row's Supabase id + whether it's still
+    # open (ended_at is null), keyed both ways since a sighting might be
+    # matched by either id depending on which existed first.
+    by_ebay_id = {str(r["ebay_item_id"]): r for r in existing_listings if r.get("ebay_item_id")}
+    by_airtable_id = {r["airtable_id"]: r for r in existing_listings if r.get("airtable_id")}
     print(f"   {len(existing_ids)} existing listing IDs loaded")
 
     print("\n📊 Loading Supabase garments (for garment_id matching)...")
@@ -183,19 +220,47 @@ def run_sync_phase():
     to_insert = []
     already_synced = already_by_at_id = no_item_id = no_garment_match = 0
     backfilled_ended = 0  # sightings synced for the first time already Sold/Expired
+    to_reconcile = []  # existing Supabase rows that are stale — Airtable already
+                        # resolved (Sold/Expired) but Supabase still shows ended_at=null.
+                        # This is what let the Darci Mini Dress stay stuck showing
+                        # active on the garment page even after Airtable itself was
+                        # already correct — neither the old sync-gap fix nor the
+                        # expiry-check phase touches EXISTING rows, only new ones
+                        # (sync) or currently-Active-in-Airtable ones (expiry check).
+                        # A row that was already resolved in Airtable before either
+                        # fix existed falls outside both, permanently, without this.
 
     for rec in sightings:
         f = rec["fields"]
         item_id = str(f.get("eBay Item ID") or "").strip()
+        status = f.get("Status")
 
         if not item_id:
             no_item_id += 1
             continue
         if item_id in existing_ids:
             already_synced += 1
+            if status in ("Sold", "Expired"):
+                existing_row = by_ebay_id.get(item_id)
+                if existing_row and existing_row.get("ended_at") is None:
+                    to_reconcile.append({
+                        "supabase_id": existing_row["id"],
+                        "reason": "sold" if status == "Sold" else "expired",
+                        "sold_price": f.get("Listed Price") if status == "Sold" else None,
+                        "sold_at": f.get("Date Sold") if status == "Sold" else None,
+                    })
             continue
         if rec["id"] in existing_airtable_ids:
             already_by_at_id += 1
+            if status in ("Sold", "Expired"):
+                existing_row = by_airtable_id.get(rec["id"])
+                if existing_row and existing_row.get("ended_at") is None:
+                    to_reconcile.append({
+                        "supabase_id": existing_row["id"],
+                        "reason": "sold" if status == "Sold" else "expired",
+                        "sold_price": f.get("Listed Price") if status == "Sold" else None,
+                        "sold_at": f.get("Date Sold") if status == "Sold" else None,
+                    })
             continue
 
         linked_garments = f.get("Garment", [])
@@ -248,21 +313,34 @@ def run_sync_phase():
     print(f"   Skipped — no eBay ID: {no_item_id}")
     print(f"   No garment match (inserted anyway): {no_garment_match}")
     print(f"   New rows, already Sold/Expired at first sync (ended_at backfilled): {backfilled_ended}")
+    print(f"   Existing rows needing reconciliation (Airtable already resolved, Supabase still open): {len(to_reconcile)}")
     print(f"   🔧 New listings to insert: {len(to_insert)}")
 
-    if not to_insert:
-        print("\n   Nothing new to insert.")
-        return
-
-    if DRY_RUN:
-        print(f"\n🧪 DRY RUN — would insert {len(to_insert)} new listings. No writes made.")
-        for row in to_insert[:5]:
-            print(f"   • {row['ebay_item_id']} | {row['title'][:50]!r} | "
-                  f"garment_id={row['garment_id']} | ended_reason={row['ended_reason']}")
+    if to_insert:
+        if DRY_RUN:
+            print(f"\n🧪 DRY RUN — would insert {len(to_insert)} new listings. No writes made.")
+            for row in to_insert[:5]:
+                print(f"   • {row['ebay_item_id']} | {row['title'][:50]!r} | "
+                      f"garment_id={row['garment_id']} | ended_reason={row['ended_reason']}")
+        else:
+            print(f"\n📝 Inserting {len(to_insert)} new listings into Supabase...")
+            inserted, errors = insert_listings(to_insert)
+            print(f"   {inserted} inserted | {errors} errors")
     else:
-        print(f"\n📝 Inserting {len(to_insert)} new listings into Supabase...")
-        inserted, errors = insert_listings(to_insert)
-        print(f"   {inserted} inserted | {errors} errors")
+        print("\n   Nothing new to insert.")
+
+    if to_reconcile:
+        if DRY_RUN:
+            print(f"\n🧪 DRY RUN — would reconcile {len(to_reconcile)} stale existing rows. No writes made.")
+            for r in to_reconcile[:5]:
+                print(f"   • supabase_id={r['supabase_id']} -> ended_reason={r['reason']}")
+        else:
+            print(f"\n📝 Reconciling {len(to_reconcile)} stale existing rows "
+                  f"(Airtable already resolved, Supabase never closed out)...")
+            reconciled, recon_errors = reconcile_stale_listings(to_reconcile)
+            print(f"   {reconciled} reconciled | {recon_errors} errors")
+    else:
+        print("\n   No stale existing rows to reconcile.")
 
 
 # ══════════════════════════════════════════════════════════════════════════
