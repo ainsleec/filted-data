@@ -212,6 +212,35 @@ def reconcile_stale_listings(items):
     return succeeded, failed
 
 
+def backfill_ebay_item_ids(items):
+    """Lightweight companion to reconcile_stale_listings — that function
+    only backfills ebay_item_id as a side effect of closing out a
+    Sold/Expired row. This handles the other half: a legacy row matched
+    via airtable_id whose ebay_item_id is still null but whose CURRENT
+    Airtable status is Active. There's no ended_at to set here (it's
+    genuinely still active), but leaving ebay_item_id null means Phase 2
+    will hit the exact same "genuinely never existed" dead end the
+    moment this listing actually does expire — so fix the ID gap now,
+    while status is simple, rather than waiting for a resolution event
+    that may never trigger the fix."""
+    succeeded, failed = 0, 0
+    for item in items:
+        resp = requests.patch(
+            f"{SUPABASE_URL}/rest/v1/listings",
+            headers=get_supabase_headers(),
+            params={"id": f"eq.{item['supabase_id']}"},
+            json={"ebay_item_id": item["item_id"]},
+            timeout=15,
+        )
+        if resp.ok:
+            succeeded += 1
+        else:
+            failed += 1
+            print(f"   ⚠️  ID backfill FAILED for {item['supabase_id']}: {resp.status_code} {resp.text[:150]}")
+        time.sleep(0.05)
+    return succeeded, failed
+
+
 def insert_listings(rows):
     """Bulk insert in batches of 50. On batch failure, retry rows individually
     so one bad row doesn't sink the other 49 good ones."""
@@ -280,6 +309,8 @@ def run_sync_phase():
     backfilled_ended = 0  # sightings synced for the first time already Sold/Expired
     to_reconcile = []  # existing Supabase rows that are stale — Airtable already
                         # resolved (Sold/Expired) but Supabase still shows ended_at=null.
+    to_backfill_id_only = []  # existing rows matched via airtable_id, still Active,
+                               # whose ebay_item_id is null — see backfill_ebay_item_ids()
 
     for rec in sightings:
         f = rec["fields"]
@@ -304,8 +335,8 @@ def run_sync_phase():
             continue
         if rec["id"] in existing_airtable_ids:
             already_by_at_id += 1
+            existing_row = by_airtable_id.get(rec["id"])
             if status in ("Sold", "Expired"):
-                existing_row = by_airtable_id.get(rec["id"])
                 if existing_row and existing_row.get("ended_at") is None:
                     # This is the path that used to be unreachable for
                     # rows whose eBay Item ID field was blank — item_id
@@ -320,6 +351,17 @@ def run_sync_phase():
                         "sold_at": f.get("Date Sold") if status == "Sold" else None,
                         "backfill_item_id": item_id if needs_backfill else None,
                     })
+            elif existing_row and not existing_row.get("ebay_item_id"):
+                # Still-Active legacy row with no ebay_item_id yet — no
+                # ended_at to set (it's genuinely active), but fix the ID
+                # gap now so Phase 2 can find this row later when it
+                # actually does need closing out. This is the second
+                # half of the same bug class as the reconcile branch
+                # above, just for rows that haven't resolved yet.
+                to_backfill_id_only.append({
+                    "supabase_id": existing_row["id"],
+                    "item_id": item_id,
+                })
             continue
 
         linked_garments = f.get("Garment", [])
@@ -375,6 +417,7 @@ def run_sync_phase():
     print(f"   No garment match (inserted anyway): {no_garment_match}")
     print(f"   New rows, already Sold/Expired at first sync (ended_at backfilled): {backfilled_ended}")
     print(f"   Existing rows needing reconciliation (Airtable already resolved, Supabase still open): {len(to_reconcile)}")
+    print(f"   Existing Active rows needing ebay_item_id backfill only: {len(to_backfill_id_only)}")
     print(f"   🔧 New listings to insert: {len(to_insert)}")
 
     if to_insert:
@@ -403,6 +446,16 @@ def run_sync_phase():
             print(f"   {reconciled} reconciled | {recon_errors} errors")
     else:
         print("\n   No stale existing rows to reconcile.")
+
+    if to_backfill_id_only:
+        if DRY_RUN:
+            print(f"\n🧪 DRY RUN — would backfill ebay_item_id on {len(to_backfill_id_only)} Active rows. No writes made.")
+        else:
+            print(f"\n📝 Backfilling ebay_item_id on {len(to_backfill_id_only)} still-Active legacy rows...")
+            bf_succeeded, bf_failed = backfill_ebay_item_ids(to_backfill_id_only)
+            print(f"   {bf_succeeded} succeeded | {bf_failed} FAILED")
+    else:
+        print("\n   No Active rows needing ID-only backfill.")
 
 
 # ══════════════════════════════════════════════════════════════════════════
