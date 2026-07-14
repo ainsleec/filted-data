@@ -18,11 +18,41 @@ Two structural fixes, both needed together:
      relies purely on dedup-by-id, so a sighting can never fall outside
      the query window based on its current status.
   2. Any sighting synced for the first time in a NON-Active state (Sold
-     or Expired) gets ended_at/ended_reason set immediately at insert —
+     or Expired) gets ended_at/end_reason set immediately at insert —
      previously only sold_price/sold_at were set for Sold rows, meaning
      a freshly-synced Sold listing would still count as "active" in
      Supabase (ended_at IS NULL) until something else closed it out,
      which nothing did.
+
+THIRD fix (this revision) — the "no eBay Item ID field" gap:
+  Some Airtable sightings have their dedicated "eBay Item ID" field
+  blank, with the ID only present inside the Listing URL. Phase 1 used
+  to require the dedicated field and skip (no_item_id++) anything
+  without it — permanently, since that skip happens BEFORE any
+  reconciliation-by-airtable_id check. Phase 2 already had a URL regex
+  fallback for exactly this case, which is how it could still correctly
+  detect and mark these as Expired in Airtable — but it could never
+  close out the matching Supabase row, because rows with
+  ebay_item_id IS NULL get filtered out of sb_listings/sb_all_ever
+  entirely when Phase 2 builds its lookup dicts. Net effect: any
+  sighting synced without its eBay Item ID field populated was stuck
+  showing "active" on the site forever, with no path back to correct
+  — Phase 1 skipped it going in, Phase 2 couldn't find it coming back.
+  Fixed by: (a) giving Phase 1 the same URL-fallback Phase 2 already
+  had, and (b) having reconciliation backfill ebay_item_id onto the
+  Supabase row whenever it derives one, so the row becomes matchable
+  by future runs even if this run only gets it partially fixed.
+
+FOURTH fix (this revision) — the end_reason/ended_reason split:
+  The listings table has two separate columns: `end_reason` (read by
+  the Worker's /garment-history endpoint — the one the frontend
+  actually displays) and `ended_reason` (a leftover from an earlier
+  schema iteration, read by nothing). This script was writing
+  exclusively to `ended_reason`, so every "why did this end" value was
+  going into a column the site never looks at. Now writes to both —
+  `end_reason` because it's the one that matters, `ended_reason` kept
+  in sync too in case anything still references it, until that column
+  is confirmed safe to drop entirely.
 
 Run order within main(): sync first, then expiry-check — so every run
 starts from as complete a picture as this pass can make it, before
@@ -60,6 +90,22 @@ HEADERS_AT = {
 }
 
 UNMATCHED_REPORT_PATH = "expiry_checker_unmatched.json"
+
+ITEM_ID_URL_RE = re.compile(r"/itm/(\d+)")
+
+
+def extract_item_id(item_id_field, listing_url):
+    """Shared by both phases now. Prefer the dedicated field; fall back
+    to parsing it out of the Listing URL when that field is blank —
+    this is the fix for sightings that only ever had the URL populated."""
+    item_id = str(item_id_field or "").strip()
+    if item_id:
+        return item_id
+    if listing_url:
+        m = ITEM_ID_URL_RE.search(listing_url)
+        if m:
+            return m.group(1)
+    return ""
 
 
 def get_supabase_headers():
@@ -127,15 +173,27 @@ def reconcile_stale_listings(items):
     despite Airtable already showing them Sold/Expired. One request per
     row rather than batching — these are individually distinct patches
     (different sold_price/sold_at per row), unlike mark_listings_ended's
-    uniform batch update."""
+    uniform batch update.
+
+    Now also backfills ebay_item_id when the row's stored value is null
+    but this run derived one (via the dedicated field or the URL
+    fallback) — this is what lets a previously-unmatchable row become
+    matchable by future runs' Phase 2, instead of staying permanently
+    stuck the way the Sahara Blouse listing was."""
     now = datetime.now(timezone.utc).isoformat()
     succeeded, failed = 0, 0
 
     for item in items:
-        patch = {"ended_at": now, "ended_reason": item["reason"]}
+        patch = {
+            "ended_at": now,
+            "end_reason": item["reason"],
+            "ended_reason": item["reason"],
+        }
         if item["reason"] == "sold":
             patch["sold_price"] = item["sold_price"]
             patch["sold_at"] = item["sold_at"] or now
+        if item.get("backfill_item_id"):
+            patch["ebay_item_id"] = item["backfill_item_id"]
 
         resp = requests.patch(
             f"{SUPABASE_URL}/rest/v1/listings",
@@ -222,17 +280,11 @@ def run_sync_phase():
     backfilled_ended = 0  # sightings synced for the first time already Sold/Expired
     to_reconcile = []  # existing Supabase rows that are stale — Airtable already
                         # resolved (Sold/Expired) but Supabase still shows ended_at=null.
-                        # This is what let the Darci Mini Dress stay stuck showing
-                        # active on the garment page even after Airtable itself was
-                        # already correct — neither the old sync-gap fix nor the
-                        # expiry-check phase touches EXISTING rows, only new ones
-                        # (sync) or currently-Active-in-Airtable ones (expiry check).
-                        # A row that was already resolved in Airtable before either
-                        # fix existed falls outside both, permanently, without this.
 
     for rec in sightings:
         f = rec["fields"]
-        item_id = str(f.get("eBay Item ID") or "").strip()
+        listing_url = f.get("Listing URL", "") or ""
+        item_id = extract_item_id(f.get("eBay Item ID"), listing_url)
         status = f.get("Status")
 
         if not item_id:
@@ -255,11 +307,18 @@ def run_sync_phase():
             if status in ("Sold", "Expired"):
                 existing_row = by_airtable_id.get(rec["id"])
                 if existing_row and existing_row.get("ended_at") is None:
+                    # This is the path that used to be unreachable for
+                    # rows whose eBay Item ID field was blank — item_id
+                    # here may have come from the URL fallback above,
+                    # and the existing row's own ebay_item_id may still
+                    # be null, so backfill it here.
+                    needs_backfill = not existing_row.get("ebay_item_id")
                     to_reconcile.append({
                         "supabase_id": existing_row["id"],
                         "reason": "sold" if status == "Sold" else "expired",
                         "sold_price": f.get("Listed Price") if status == "Sold" else None,
                         "sold_at": f.get("Date Sold") if status == "Sold" else None,
+                        "backfill_item_id": item_id if needs_backfill else None,
                     })
             continue
 
@@ -269,7 +328,6 @@ def run_sync_phase():
         if not garment_id:
             no_garment_match += 1
 
-        status = f.get("Status")
         now_iso = datetime.now(timezone.utc).isoformat()
 
         row = {
@@ -277,7 +335,7 @@ def run_sync_phase():
             "garment_id":   garment_id,
             "ebay_item_id": item_id,
             "title":        f.get("eBay Title", "") or "",
-            "listing_url":  f.get("Listing URL", "") or "",
+            "listing_url":  listing_url,
             "seller_name":  f.get("Seller Name", "") or "",
             "condition":    f.get("Condition", "") or "",
             "listed_price": f.get("Listed Price"),
@@ -285,6 +343,7 @@ def run_sync_phase():
             "sold_price":   None,
             "sold_at":      None,
             "ended_at":     None,
+            "end_reason":   None,
             "ended_reason": None,
         }
 
@@ -292,6 +351,7 @@ def run_sync_phase():
             row["sold_price"]   = f.get("Listed Price")
             row["sold_at"]      = f.get("Date Sold") or None
             row["ended_at"]     = f.get("Date Sold") or now_iso
+            row["end_reason"]   = "sold"
             row["ended_reason"] = "sold"
             backfilled_ended += 1
         elif status == "Expired":
@@ -299,6 +359,7 @@ def run_sync_phase():
             # "now" is the best available timestamp. Still infinitely
             # better than the row never existing at all (the old bug).
             row["ended_at"]     = now_iso
+            row["end_reason"]   = "expired"
             row["ended_reason"] = "expired"
             backfilled_ended += 1
         # Active (or any other/unknown status) → all ended_* stay None,
@@ -310,7 +371,7 @@ def run_sync_phase():
 
     print(f"\n   Already synced (by eBay ID): {already_synced}")
     print(f"   Already synced (by airtable_id): {already_by_at_id}")
-    print(f"   Skipped — no eBay ID: {no_item_id}")
+    print(f"   Skipped — no eBay ID (field blank AND unparseable from URL): {no_item_id}")
     print(f"   No garment match (inserted anyway): {no_garment_match}")
     print(f"   New rows, already Sold/Expired at first sync (ended_at backfilled): {backfilled_ended}")
     print(f"   Existing rows needing reconciliation (Airtable already resolved, Supabase still open): {len(to_reconcile)}")
@@ -321,7 +382,7 @@ def run_sync_phase():
             print(f"\n🧪 DRY RUN — would insert {len(to_insert)} new listings. No writes made.")
             for row in to_insert[:5]:
                 print(f"   • {row['ebay_item_id']} | {row['title'][:50]!r} | "
-                      f"garment_id={row['garment_id']} | ended_reason={row['ended_reason']}")
+                      f"garment_id={row['garment_id']} | end_reason={row['end_reason']}")
         else:
             print(f"\n📝 Inserting {len(to_insert)} new listings into Supabase...")
             inserted, errors = insert_listings(to_insert)
@@ -333,7 +394,8 @@ def run_sync_phase():
         if DRY_RUN:
             print(f"\n🧪 DRY RUN — would reconcile {len(to_reconcile)} stale existing rows. No writes made.")
             for r in to_reconcile[:5]:
-                print(f"   • supabase_id={r['supabase_id']} -> ended_reason={r['reason']}")
+                tag = " (+ backfilling ebay_item_id)" if r.get("backfill_item_id") else ""
+                print(f"   • supabase_id={r['supabase_id']} -> reason={r['reason']}{tag}")
         else:
             print(f"\n📝 Reconciling {len(to_reconcile)} stale existing rows "
                   f"(Airtable already resolved, Supabase never closed out)...")
@@ -360,7 +422,7 @@ def mark_listings_ended(listing_ids, reason):
             f"{SUPABASE_URL}/rest/v1/listings",
             headers=get_supabase_headers(),
             params={"id": f"in.({id_list})", "or": "(ended_reason.is.null,ended_reason.neq.sold)"},
-            json={"ended_at": now, "ended_reason": reason},
+            json={"ended_at": now, "end_reason": reason, "ended_reason": reason},
             timeout=15,
         )
         if resp.ok:
@@ -487,14 +549,11 @@ def run_expiry_check_phase():
         if len(to_check) >= BATCH_LIMIT:
             break
         f = rec["fields"]
-        url = f.get("Listing URL", "")
-        item_id = str(f.get("eBay Item ID") or "").strip()
+        url = f.get("Listing URL", "") or ""
+        item_id = extract_item_id(f.get("eBay Item ID"), url)
         if not item_id:
-            m = re.search(r"/itm/(\d+)", url)
-            if not m:
-                skipped_no_id += 1
-                continue
-            item_id = m.group(1)
+            skipped_no_id += 1
+            continue
         date_listed = f.get("Date Listed")
         if date_listed:
             try:
