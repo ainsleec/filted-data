@@ -33,6 +33,35 @@ is not reliably just the lowercased display name (this bit a previous
 version of this pipeline once already: 'Listed Price' -> 'listing-price',
 not 'listed-price'). Treat every *_FIELD_SLUG constant below as a
 placeholder to verify, not a confirmed value.
+
+--------------------------------------------------------------------------
+2026-07 REVISION NOTES (slug bug fixes):
+
+1. slugify() previously did not strip accented characters. Python 3's
+   \\w in regex already matches Unicode word characters, so "Allégro"
+   passed straight through the "strip non-word-chars" step unchanged and
+   was sent to Webflow as "allégro-..." — which fails Webflow's slug
+   validation pattern (^[_a-zA-Z0-9][-_a-zA-Z0-9]*$) outright on every
+   POST (new item creation). Fixed by transliterating to ASCII first via
+   unicodedata NFKD normalization before the regex ever runs.
+
+2. build_slug() previously had NO collision detection in code at all —
+   uniqueness relied entirely on a manual pre-run check described in the
+   old docstring ("verified manually before each run rather than
+   enforced in code"). Any two garments sharing an identical Name+Colour
+   combination (most commonly ones with a blank Product Code, so no
+   fallback value existed either) collided outright on PATCH with
+   "Unique value is already in database" — silently failing every run
+   since nothing caught it upstream.
+
+   Fixed by loading every live slug from the Webflow Garments collection
+   once at the start of sync_garments(), and giving build_slug() a real
+   fallback chain: base slug -> base+product-code -> base+numeric
+   suffix. The in-memory existing_slugs map is updated after each
+   successful create/update too, so collisions between two *new* items
+   in the same run are also caught, not just collisions against
+   already-live items.
+--------------------------------------------------------------------------
 """
 
 import os
@@ -40,6 +69,7 @@ import re
 import sys
 import time
 import json
+import unicodedata
 import requests
 
 # ── Config ───────────────────────────────────────────────────────────────
@@ -214,15 +244,13 @@ def get_supabase_garment_uuid(airtable_id):
 
 def update_supabase_garment_slug(supabase_uuid, slug):
     """Keeps Supabase's garments.slug in sync with Webflow's real slug on
-    every run — this is the actual fix for the drift that required
-    backfill_supabase_slugs.py in the first place. Supabase's slug was
-    seeded once (2026-06-10) and never updated since because nothing
-    wrote back to it; the worker's /campaigns/:slug endpoint reads this
-    column directly to build garment links on campaign pages, so letting
-    it go stale again would silently reintroduce the same 404s. Best
-    effort — a failure here logs a warning but doesn't fail the whole
-    garment sync, since Webflow itself (the source of truth) is already
-    correctly updated regardless."""
+    every run. Best effort — a failure here logs a warning but doesn't
+    fail the whole garment sync, since Webflow itself (the source of
+    truth) is already correctly updated regardless. Now that build_slug()
+    guarantees uniqueness against live Webflow slugs (see revision notes
+    at the top of this file), this should no longer hit Supabase's own
+    unique constraint on garments.slug either — the same corrected,
+    collision-free slug is what gets written here."""
     if DRY_RUN:
         print(f"  [DRY RUN] would update Supabase garments.slug for {supabase_uuid} -> {slug}")
         return
@@ -261,8 +289,29 @@ def kv_write_redirect(old_slug, new_slug, path_prefix="/garments/"):
 
 
 # ── Slug logic ────────────────────────────────────────────────────────────
+def strip_accents(text):
+    """Transliterate accented/diacritic Unicode characters to their closest
+    plain-ASCII equivalent, e.g. 'é' -> 'e', 'á' -> 'a', 'Dámour' -> 'Damour'.
+
+    Implemented via stdlib unicodedata (no external dependency like
+    unidecode required). NFKD decomposition splits each accented character
+    into a base letter + a separate combining-mark codepoint; encoding to
+    ASCII with errors='ignore' then drops the combining marks, leaving just
+    the base letter behind.
+
+    This does NOT handle every possible Unicode edge case (e.g. characters
+    with no decomposable base letter, like 'ø' or 'æ', pass through as
+    empty/unchanged) — but it covers the standard Latin diacritics that
+    have actually caused failures in production (é, á, ê, etc.).
+    """
+    normalized = unicodedata.normalize("NFKD", text)
+    return normalized.encode("ascii", "ignore").decode("ascii")
+
+
 def slugify(text):
-    text = (text or "").lower().strip()
+    text = (text or "").strip()
+    text = strip_accents(text)
+    text = text.lower()
     text = re.sub(r"[^\w\s-]", "", text)
     text = re.sub(r"[\s_]+", "-", text)
     text = re.sub(r"-+", "-", text)
@@ -270,32 +319,56 @@ def slugify(text):
     return text[:80]
 
 
-def build_slug(record_id, name_formula, fallback_name):
+def build_slug(record_id, name_formula, fallback_name, product_code, existing_slugs, self_wf_id=None):
     """Single source of truth: slugify the Name (Formula) field.
 
-    Deliberately does NOT append Product Colour or Product Code
-    separately — Name (Formula) is trusted as-is, whatever it produces
-    (with colour appended when present, bare name when not — e.g. for
-    Alemais, which has no Product Colour data at all).
+    Deliberately does NOT append Product Colour separately — Name
+    (Formula) is trusted as-is, whatever it produces (with colour
+    appended when present, bare name when not — e.g. for Alemais, which
+    has no Product Colour data at all).
 
-    IMPORTANT PRE-CONDITION, verified manually before each run rather
-    than enforced in code: this assumes no two garments from the same
-    designer share an identical Garment Name where colour is also blank
-    (which would produce a genuine slug collision, since nothing else
-    would disambiguate them). Checked via an Airtable extension before
-    running — if that check ever turns up a duplicate, this function
-    will need a fallback again (e.g. Product Code) for that specific
-    case rather than reintroducing one globally.
+    Uniqueness is now enforced in code, not by manual pre-run checking:
+    existing_slugs is a dict of {slug: webflow_item_id} for every item
+    currently live in the Garments collection (loaded once at the start
+    of sync_garments(), and kept updated as this run creates/updates
+    items, so collisions between two brand-new items in the same run are
+    also caught). self_wf_id is this garment's own existing Webflow item
+    ID, if any — so a garment being re-synced with the same slug it
+    already has isn't flagged as colliding with itself.
+
+    Fallback chain if the base slug is taken by a *different* item:
+      1. base slug + slugified Product Code (if Product Code is set)
+      2. base slug + numeric suffix (-2, -3, ...) — guaranteed unique,
+         used when Product Code is blank/still collides.
 
     If Name (Formula) is somehow blank, falls back to the raw Garment
-    Name plus a short id suffix so slugs never collide outright."""
+    Name plus a short id suffix so slugs never collide outright.
+    """
     base = name_formula or fallback_name or ""
     slug = slugify(base)
     if not slug:
         slug = slugify(fallback_name or "garment")
     if len(slug) < 3:
         slug = f"{slug}-{record_id[-8:].lower()}"
-    return slug
+
+    def taken(candidate):
+        owner = existing_slugs.get(candidate)
+        return owner is not None and owner != self_wf_id
+
+    if not taken(slug):
+        return slug
+
+    if product_code:
+        candidate = f"{slug}-{slugify(product_code)}"
+        if candidate and not taken(candidate):
+            return candidate
+
+    suffix = 2
+    candidate = f"{slug}-{suffix}"
+    while taken(candidate):
+        suffix += 1
+        candidate = f"{slug}-{suffix}"
+    return candidate
 
 
 # ── Webflow helpers ───────────────────────────────────────────────────────
@@ -635,6 +708,15 @@ def sync_campaigns(qualifying_garments):
 
 # ── Step 5: sync Garments ─────────────────────────────────────────────────
 def sync_garments(qualifying_garments, campaign_webflow_ids, designer_webflow_ids):
+    print("Loading existing Webflow garment slugs for collision checking...")
+    existing_items = webflow_all_items(GARMENTS_COLLECTION_ID)
+    existing_slugs = {}
+    for item in existing_items:
+        s = item.get("fieldData", {}).get(WF_FIELD_SLUG)
+        if s:
+            existing_slugs[s] = item["id"]
+    print(f"  {len(existing_slugs)} existing slugs loaded from {len(existing_items)} live items")
+
     synced = []
     failures = []
 
@@ -646,9 +728,13 @@ def sync_garments(qualifying_garments, campaign_webflow_ids, designer_webflow_id
         display_name = name_formula or garment_name or "(unnamed)"
 
         try:
-            new_slug = build_slug(airtable_id, name_formula, garment_name)
-
             existing_wf_id = f.get(FLD_WEBFLOW_ITEM_ID)
+
+            new_slug = build_slug(
+                airtable_id, name_formula, garment_name, f.get(FLD_PRODUCT_CODE, ""),
+                existing_slugs, self_wf_id=existing_wf_id,
+            )
+
             existing_item = webflow_get_item(GARMENTS_COLLECTION_ID, existing_wf_id) if existing_wf_id else None
 
             supabase_uuid = get_supabase_garment_uuid(airtable_id)  # may be None — see module docstring
@@ -701,6 +787,11 @@ def sync_garments(qualifying_garments, campaign_webflow_ids, designer_webflow_id
                 wf_item_id = created["id"]
                 airtable_update(GARMENTS_TABLE, airtable_id, {FLD_WEBFLOW_ITEM_ID: wf_item_id})
                 webflow_undraft_item(GARMENTS_COLLECTION_ID, wf_item_id)
+
+            # Register this slug immediately so a later garment in the same
+            # run — including any that previously collided with THIS one
+            # before it existed — sees it as taken too.
+            existing_slugs[new_slug] = wf_item_id
 
             synced.append({
                 "airtable_id": airtable_id,
