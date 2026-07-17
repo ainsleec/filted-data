@@ -48,10 +48,25 @@ ordering is guaranteed by the code instead of two independent cron
 schedules, and end_reason/ended_reason can't split again for sold rows
 either.
 
-Run order within main(): sync, then expiry-check, then sold-verify — so
-every run starts from as complete a picture as this pass can make it,
-checks what's still genuinely active on eBay, and finally lets Airtable's
-hand-verified sales overwrite any "expired" guess with the real outcome.
+SIXTH fix (this revision) — aggregate stats were never recomputed: the
+`garments` table carries active_listing_count / listed_price_median /
+listed_price_min / listed_price_max columns, read by both the campaign
+embed's resale pill and search_garments()'s ranking tie-break — but
+nothing anywhere (no script, no Postgres trigger, no pg_cron job) ever
+recalculated them after each garment row was first created. They were
+frozen at whatever value existed on day one, silently drifting further
+from reality with every listing opened or closed since. Phase 4 below
+calls a Postgres function (recompute_garment_stats() — see
+recompute_garment_stats.sql, run once manually before this script's
+first run with this phase) that recalculates all four columns from
+CURRENTLY ACTIVE listings in one pass, at the end of every run.
+
+Run order within main(): sync, then expiry-check, then sold-verify, then
+recompute-stats — so every run starts from as complete a picture as this
+pass can make it, checks what's still genuinely active on eBay, lets
+Airtable's hand-verified sales overwrite any "expired" guess with the
+real outcome, and finally recalculates every garment's aggregate numbers
+from that now-correct end state.
 
 Required env vars:
   AIRTABLE_TOKEN, AIRTABLE_BASE, RESALE_SIGHTINGS_TABLE
@@ -867,6 +882,46 @@ def run_sold_sync_phase():
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# PHASE 4 — Recompute garment aggregate stats: active_listing_count,
+# listed_price_median, listed_price_min, listed_price_max on the
+# `garments` table. These are read by the campaign embed's resale pill
+# and by search_garments()'s ranking tie-break, but nothing has ever
+# recalculated them after each garment row's initial creation (confirmed:
+# no Postgres function beyond search_garments(), no triggers on any
+# table, pg_cron not even enabled). Calls a single Postgres function
+# (recompute_garment_stats(), defined in recompute_garment_stats.sql —
+# run that once manually before this script's first run with this phase)
+# so the aggregation itself happens inside the database rather than
+# pulling every listings row into Python to compute a median.
+# ══════════════════════════════════════════════════════════════════════════
+
+def run_recompute_stats_phase():
+    print("\n" + "═" * 60)
+    print("PHASE 4 — Recompute garment aggregate stats")
+    print("═" * 60)
+
+    if DRY_RUN:
+        print("   🧪 DRY RUN — skipping recompute (this phase only ever reads/aggregates "
+              "live listings data, nothing to preview differently in dry-run mode)")
+        return
+
+    resp = requests.post(
+        f"{SUPABASE_URL}/rest/v1/rpc/recompute_garment_stats",
+        headers=get_supabase_headers(),
+        json={},
+        timeout=60,
+    )
+    if resp.ok:
+        print("   ✅ Garment aggregate stats recomputed (active_listing_count, "
+              "listed_price_median, listed_price_min, listed_price_max)")
+    else:
+        print(f"   ⚠️  Recompute FAILED: {resp.status_code} {resp.text[:300]}")
+        print("   NOTE: if this is the first run with this phase, confirm you've run "
+              "recompute_garment_stats.sql once in the Supabase SQL editor first — "
+              "this call will 404/error if that function doesn't exist yet.")
+
+
+# ══════════════════════════════════════════════════════════════════════════
 def main():
     run_start = datetime.now(timezone.utc)
     print(f"🔄 Filted — Listings Sync + Expiry Check + Sold Verification (consolidated)")
@@ -878,6 +933,7 @@ def main():
     run_sync_phase()
     run_expiry_check_phase()
     run_sold_sync_phase()
+    run_recompute_stats_phase()
 
     elapsed = (datetime.now(timezone.utc) - run_start).seconds
     print(f"\n✅ Done in {elapsed}s")
