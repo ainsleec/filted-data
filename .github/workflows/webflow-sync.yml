@@ -11,6 +11,10 @@ on:
         description: 'Dry run (no writes)'
         required: false
         default: 'false'
+      full_sync:
+        description: 'Force a FULL sync — ignore webflow_last_sync.txt and process every qualifying garment (use after changing field mappings or slug logic). Expect ~4h runtime.'
+        required: false
+        default: 'false'
       designer_filter:
         description: 'Restrict to designer(s), comma-separated (blank = all in-feed)'
         required: false
@@ -31,15 +35,12 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Install dependencies
         run: pip install requests
-
       - name: Run Webflow sync
         env:
           AIRTABLE_TOKEN:             ${{ secrets.AIRTABLE_TOKEN }}
@@ -50,28 +51,34 @@ jobs:
           CLOUDFLARE_KV_NAMESPACE_ID: ${{ secrets.CLOUDFLARE_KV_NAMESPACE_ID }}
           CLOUDFLARE_API_TOKEN:       ${{ secrets.CLOUDFLARE_API_TOKEN }}
           DRY_RUN:                    ${{ github.event.inputs.dry_run || 'false' }}
+          FULL_SYNC:                  ${{ github.event.inputs.full_sync || 'false' }}
           DESIGNER_FILTER:            ${{ github.event.inputs.designer_filter || '' }}
           LIMIT:                      ${{ github.event.inputs.limit || '' }}
           SIGHTED_ONLY:               ${{ github.event.inputs.sighted_only || 'false' }}
         run: python scripts/webflow_sync.py
-
-      - name: Commit updated garments.json
+      - name: Commit updated garments.json + sync timestamp
         if: ${{ github.event.inputs.dry_run != 'true' }}   # never commit during a dry run
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          # CRITICAL: webflow_last_sync.txt MUST be committed alongside
+          # garments.json — it's the incremental-sync cutoff. If it never
+          # lands in the repo, every run is a full ~4h sync forever.
+          # (Guard the add: the file won't exist yet on the very first run
+          # if that run had garment failures, since the script only writes
+          # it on a zero-failure run.)
           git add garments.json
+          [ -f webflow_last_sync.txt ] && git add webflow_last_sync.txt
           git diff --cached --quiet && exit 0   # nothing changed, nothing to push
-
-          git commit -m "Update garments.json [automated]"
-
-          # This run can take ~3 hours — other workflows (backfills, other
-          # syncs) may well push to main while it's running. A plain
-          # `git push` would then fail outright and the whole garments.json
-          # update would be lost even though the real Webflow/Airtable/
-          # Supabase writes already succeeded independently of this step.
-          # Retry with a rebase against the latest main a few times before
-          # actually giving up.
+          git commit -m "Update garments.json + sync timestamp [automated]"
+          # A full-sync run can take ~4 hours — other workflows (backfills,
+          # other syncs) may well push to main while it's running. A plain
+          # `git push` would then fail outright and the garments.json +
+          # timestamp update would be lost even though the real Webflow/
+          # Airtable/Supabase writes already succeeded independently of
+          # this step. Losing the timestamp is the expensive part: the
+          # next run would fall back to a full sync. Retry with a rebase
+          # against the latest main a few times before actually giving up.
           for attempt in 1 2 3 4 5; do
             if git push; then
               echo "Push succeeded on attempt $attempt"
@@ -82,5 +89,6 @@ jobs:
             git rebase origin/main || { echo "Rebase conflict — manual resolution needed"; exit 1; }
             sleep 5
           done
-          echo "Push still failing after 5 attempts — giving up. garments.json commit exists locally in this run's log but was NOT pushed."
+          echo "Push still failing after 5 attempts — giving up. Commit exists locally in this run's log but was NOT pushed."
+          echo "NOTE: next run will re-process this run's modified window (timestamp never landed) — wasteful but safe."
           exit 1
