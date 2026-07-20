@@ -318,6 +318,63 @@ def reconcile_stale_listings(items):
     return succeeded, failed
 
 
+def reactivate_relisted_listings(items):
+    """Handles TRUE relists — new_listings.py's relist detection matches
+    an incoming eBay result on (seller, exact title) against an existing
+    Airtable record, and deliberately overwrites that record in place
+    with the new eBay Item ID/URL/price rather than creating a fresh
+    record — this preserves the garment match and avoids re-running
+    matching on every relist, which is the efficient behaviour we want
+    to keep.
+
+    But that means the matching Supabase row (found here via
+    airtable_id, since ebay_item_id itself just changed) would otherwise
+    keep pointing at the OLD, now-dead eBay Item ID forever — Phase 2
+    can never find it again by the new ID to verify or close it out, and
+    the prior price point vanishes with no trace it ever existed.
+
+    This snapshots the row's old listed_price/started_at into
+    price_history (appending to whatever's already there) before
+    overwriting, then refreshes ebay_item_id/listing_url/listed_price/
+    started_at to the new listing's values. If the row had already been
+    closed out under the old ID (e.g. a previous run's Phase 2 marked it
+    expired after the old listing vanished, not realising it was simply
+    relisted), this also reopens it — ended_at/end_reason/ended_reason/
+    sold_price/sold_at all cleared, since it's demonstrably active again
+    under the new ID."""
+    succeeded, failed = 0, 0
+    for item in items:
+        patch = {
+            "ebay_item_id": item["new_item_id"],
+            "listing_url":  item["new_url"],
+            "listed_price": item["new_price"],
+            "started_at":   item["new_started_at"],
+            "price_history": item["price_history"],
+        }
+        if item["was_closed"]:
+            patch.update({
+                "ended_at": None,
+                "end_reason": None,
+                "ended_reason": None,
+                "sold_price": None,
+                "sold_at": None,
+            })
+        resp = requests.patch(
+            f"{SUPABASE_URL}/rest/v1/listings",
+            headers=get_supabase_headers(),
+            params={"id": f"eq.{item['supabase_id']}"},
+            json=patch,
+            timeout=15,
+        )
+        if resp.ok:
+            succeeded += 1
+        else:
+            failed += 1
+            print(f"   ⚠️  Relist reactivation FAILED for {item['supabase_id']}: {resp.status_code} {resp.text[:150]}")
+        time.sleep(0.05)
+    return succeeded, failed
+
+
 def backfill_ebay_item_ids(items):
     """Lightweight companion to reconcile_stale_listings — that function
     only backfills ebay_item_id as a side effect of closing out a
@@ -382,7 +439,10 @@ def run_sync_phase():
     print("═" * 60)
 
     print("📊 Loading existing Supabase listings (for dedup + reconciliation)...")
-    existing_listings = load_all_supabase_rows("listings", "id,ebay_item_id,airtable_id,ended_at")
+    existing_listings = load_all_supabase_rows(
+        "listings",
+        "id,ebay_item_id,airtable_id,ended_at,listed_price,started_at,price_history"
+    )
     existing_ids = {str(r["ebay_item_id"]) for r in existing_listings if r.get("ebay_item_id")}
     existing_airtable_ids = {r["airtable_id"] for r in existing_listings if r.get("airtable_id")}
     by_ebay_id = {str(r["ebay_item_id"]): r for r in existing_listings if r.get("ebay_item_id")}
@@ -407,6 +467,9 @@ def run_sync_phase():
     backfilled_ended = 0
     to_reconcile = []
     to_backfill_id_only = []
+    to_reactivate = []  # TRUE relists — same Airtable record, new eBay Item ID
+
+    run_now_iso = datetime.now(timezone.utc).isoformat()
 
     for rec in sightings:
         f = rec["fields"]
@@ -447,6 +510,29 @@ def run_sync_phase():
                     "supabase_id": existing_row["id"],
                     "item_id": item_id,
                 })
+            elif status == "Active" and existing_row:
+                stored_item_id = str(existing_row.get("ebay_item_id") or "")
+                if stored_item_id and item_id and stored_item_id != item_id:
+                    # TRUE RELIST: new_listings.py's relist detection matched
+                    # this Airtable record by (seller, title) and overwrote it
+                    # in place with a new eBay Item ID — the underlying
+                    # listing genuinely changed, it's not just a field edit.
+                    # Snapshot the old price/date before it's gone.
+                    old_history = existing_row.get("price_history") or []
+                    if existing_row.get("listed_price") is not None:
+                        old_history = old_history + [{
+                            "date": existing_row.get("started_at") or run_now_iso,
+                            "price": existing_row.get("listed_price"),
+                        }]
+                    to_reactivate.append({
+                        "supabase_id": existing_row["id"],
+                        "new_item_id": item_id,
+                        "new_url": listing_url,
+                        "new_price": f.get("Listed Price"),
+                        "new_started_at": f.get("Date Listed") or None,
+                        "price_history": old_history,
+                        "was_closed": existing_row.get("ended_at") is not None,
+                    })
             continue
 
         linked_garments = f.get("Garment", [])
@@ -497,6 +583,7 @@ def run_sync_phase():
     print(f"   No garment match (inserted anyway): {no_garment_match}")
     print(f"   New rows, already Sold/Expired at first sync (ended_at backfilled): {backfilled_ended}")
     print(f"   Existing rows needing reconciliation (Airtable already resolved, Supabase still open): {len(to_reconcile)}")
+    print(f"   Existing rows relisted under a new eBay Item ID: {len(to_reactivate)}")
     print(f"   Existing Active rows needing ebay_item_id backfill only: {len(to_backfill_id_only)}")
     print(f"   🔧 New listings to insert: {len(to_insert)}")
 
@@ -536,6 +623,19 @@ def run_sync_phase():
             print(f"   {bf_succeeded} succeeded | {bf_failed} FAILED")
     else:
         print("\n   No Active rows needing ID-only backfill.")
+
+    if to_reactivate:
+        if DRY_RUN:
+            print(f"\n🧪 DRY RUN — would reactivate {len(to_reactivate)} relisted rows under new eBay Item IDs. No writes made.")
+            for r in to_reactivate[:5]:
+                print(f"   • supabase_id={r['supabase_id']} -> new item_id={r['new_item_id']} "
+                      f"(price history now has {len(r['price_history'])} point(s))")
+        else:
+            print(f"\n📝 Reactivating {len(to_reactivate)} relisted rows under new eBay Item IDs...")
+            react_succeeded, react_failed = reactivate_relisted_listings(to_reactivate)
+            print(f"   {react_succeeded} reactivated | {react_failed} FAILED")
+    else:
+        print("\n   No relisted rows needing reactivation.")
 
 
 # ══════════════════════════════════════════════════════════════════════════
