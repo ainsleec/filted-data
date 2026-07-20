@@ -61,6 +61,77 @@ placeholder to verify, not a confirmed value.
    successful create/update too, so collisions between two *new* items
    in the same run are also caught, not just collisions against
    already-live items.
+
+--------------------------------------------------------------------------
+2026-07 REVISION NOTES (rate-limit fixes):
+
+3. webflow_all_items() previously called requests.get() directly with no
+   retry handling and no throttling — the slug-preload fetch alone is
+   70+ back-to-back requests against the ~7,000-item Garments collection,
+   which blows straight through Webflow's 60 requests/minute limit and
+   killed a full production run with an uncaught 429 at offset 2200
+   (before a single garment had synced). Fixed two ways:
+
+   a. Every Webflow call in this file — including plain GETs, item
+      lookups, and pagination — now routes through webflow_request(),
+      which retries on 429 (respecting Retry-After) and 5xx. No raw
+      requests.get/post/patch against api.webflow.com remains anywhere.
+
+   b. webflow_all_items() also throttles proactively with a 1.1s sleep
+      between pages (~54 req/min ceiling), so the preload rarely needs
+      the retry path at all. Adds ~80s to a full 7,000-item fetch —
+      negligible in a GitHub Actions run, and makes the fetch
+      deterministic instead of dependent on how much request budget the
+      campaign/designer phases happened to consume beforehand.
+
+   webflow_request() also gained `params` (for paginated GETs) and
+   `allow_404` (so webflow_get_item's existing 404 -> None contract is
+   preserved through the shared wrapper).
+
+--------------------------------------------------------------------------
+2026-07 REVISION NOTES (incremental garment sync):
+
+4. Garments are now synced INCREMENTALLY: only garments modified in
+   Airtable since the last successful run (plus any garment with a blank
+   Webflow Item ID, i.e. never created) are actually processed. A full
+   ~7,000-garment run is at minimum ~14,000 Webflow calls (GET + PATCH
+   each) — roughly four hours at the 60/min rate limit, uncomfortably
+   close to GitHub Actions' six-hour job kill. A typical daily run
+   touches a few dozen garments, not thousands.
+
+   How it works:
+   - The last successful sync time is stored in webflow_last_sync.txt,
+     committed to the repo by the Actions workflow (same pattern as the
+     old pipeline's GitHub-stored incremental timestamps). Missing file
+     -> full sync. FULL_SYNC=true env var forces a full run regardless.
+   - Modified detection is a single extra server-side Airtable fetch
+     using a field-scoped LAST_MODIFIED_TIME() in filterByFormula —
+     scoped to the exact fields this script pushes to Webflow, so
+     unrelated writes (e.g. listings_sync.py touching sighting rollups)
+     don't trigger pointless re-syncs. NOTE: LAST_MODIFIED_TIME cannot
+     track formula fields, so "Name (Formula)" is covered via its input
+     fields (Garment Name, Product Colour) — if the formula ever gains
+     another input field, add it to MODIFIED_TRACKED_FIELDS below.
+   - Campaigns and Designers still sync in FULL every run — they're tiny
+     (dozens of items) and campaign scope must come from the full
+     qualifying set, or a campaign only referenced by unmodified
+     garments would silently stop updating.
+   - garments.json is now MERGED, not overwritten: the previous file's
+     entries are kept and only re-synced garments replace their old
+     entry. Otherwise an incremental run would shrink the search index
+     to just that day's modified garments. (Garments are create-once-
+     permanent, so no removal pass is needed.)
+   - The timestamp only advances when a run finishes with ZERO garment
+     failures — so a failed garment is retried on the next run rather
+     than falling permanently outside the modified window. Cost: the
+     other garments in that (small) modified window get re-updated once.
+   - The new timestamp is the run's START time, not its end — so records
+     edited while a long run is in progress are picked up next run
+     instead of slipping through the gap.
+
+   WORKFLOW CHANGE REQUIRED: the GitHub Actions workflow must commit
+   webflow_last_sync.txt alongside garments.json after the run, or every
+   run will be a full sync forever.
 --------------------------------------------------------------------------
 """
 
@@ -70,6 +141,8 @@ import sys
 import time
 import json
 import unicodedata
+from datetime import datetime, timezone
+
 import requests
 
 # ── Config ───────────────────────────────────────────────────────────────
@@ -182,6 +255,37 @@ SUPABASE_HEADERS = {
 
 GARMENTS_JSON_PATH = "garments.json"
 
+# Incremental sync state — ISO-8601 UTC timestamp of the last successful
+# run's START time, committed to the repo by the Actions workflow (make
+# sure the workflow's commit step includes this file, not just
+# garments.json). Missing/unreadable file -> full sync.
+LAST_SYNC_PATH = "webflow_last_sync.txt"
+
+# FULL_SYNC=true forces every qualifying garment to be processed,
+# ignoring webflow_last_sync.txt. Use after changing field mappings, slug
+# logic, or anything else where already-synced items need a re-push.
+FULL_SYNC = os.environ.get("FULL_SYNC", "false").lower() == "true"
+
+# The Airtable fields whose modification should trigger a garment
+# re-sync — i.e. exactly the set of source fields this script pushes to
+# Webflow. Field-scoped so writes to OTHER fields on the same record
+# (sighting rollups, listings_sync.py bookkeeping, this script's own
+# "Webflow Item ID" write-back on create) do NOT count as modifications.
+# "Name (Formula)" can't be tracked directly (formula fields have no
+# modified time) — its inputs (Garment Name, Product Colour) are listed
+# instead. If that formula ever gains another input, add it here.
+MODIFIED_TRACKED_FIELDS = [
+    FLD_GARMENT_NAME, FLD_DESIGNER, FLD_COLLECTION, FLD_PRODUCT_CODE,
+    FLD_PRODUCT_COLOUR, FLD_CATEGORY, FLD_RRP, FLD_IMAGE_1,
+]
+
+# Seconds to sleep between pages when paginating a full Webflow
+# collection fetch. 1.1s keeps the fetch at ~54 requests/minute — safely
+# under Webflow's 60/min limit with headroom for the occasional call
+# elsewhere in the run — so webflow_all_items() almost never has to fall
+# back to the reactive 429 retry path.
+WEBFLOW_PAGINATION_SLEEP = 1.1
+
 
 # ── Airtable helpers ─────────────────────────────────────────────────────
 def airtable_fetch_all(table, filter_formula=None, fields=None):
@@ -228,6 +332,58 @@ def airtable_update(table, record_id, fields):
     res = requests.patch(url, headers=AIRTABLE_HEADERS, json={"fields": fields}, timeout=30)
     res.raise_for_status()
     return res.json()
+
+
+# ── Incremental sync helpers ─────────────────────────────────────────────
+def read_last_sync_timestamp():
+    """Returns the ISO timestamp string from the last successful run, or
+    None (meaning: full sync) if the file is missing/empty/unreadable or
+    FULL_SYNC=true was passed."""
+    if FULL_SYNC:
+        print("FULL_SYNC=true — ignoring last-sync timestamp, processing all qualifying garments.")
+        return None
+    try:
+        with open(LAST_SYNC_PATH) as fp:
+            ts = fp.read().strip()
+        if not ts:
+            return None
+        # Sanity check it parses — a corrupted file should mean "full
+        # sync", never a malformed formula sent to Airtable.
+        datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return ts
+    except FileNotFoundError:
+        print(f"No {LAST_SYNC_PATH} found — treating as first run, full sync.")
+        return None
+    except ValueError:
+        print(f"WARNING: {LAST_SYNC_PATH} contents unparseable — falling back to full sync.")
+        return None
+
+
+def write_last_sync_timestamp(ts):
+    if DRY_RUN:
+        print(f"  [DRY RUN] would write {LAST_SYNC_PATH} = {ts}")
+        return
+    with open(LAST_SYNC_PATH, "w") as fp:
+        fp.write(ts + "\n")
+    print(f"Wrote {LAST_SYNC_PATH} = {ts}")
+
+
+def get_modified_garment_ids(last_sync_iso):
+    """One extra server-side Airtable fetch returning the record IDs of
+    garments that need processing this run:
+      - blank Webflow Item ID (never created — always process), OR
+      - any MODIFIED_TRACKED_FIELDS field changed since last_sync_iso.
+
+    Uses a field-scoped LAST_MODIFIED_TIME() so only changes to the
+    fields we actually push to Webflow count (see config notes). Fetches
+    just one lightweight field since only the IDs are needed."""
+    scoped_fields = ", ".join("{" + fld + "}" for fld in MODIFIED_TRACKED_FIELDS)
+    formula = (
+        f"OR({{{FLD_WEBFLOW_ITEM_ID}}}='', "
+        f"IS_AFTER(LAST_MODIFIED_TIME({scoped_fields}), '{last_sync_iso}'))"
+    )
+    records = airtable_fetch_all(GARMENTS_TABLE, filter_formula=formula, fields=[FLD_GARMENT_NAME])
+    return {r["id"] for r in records}
 
 
 # ── Supabase helper ──────────────────────────────────────────────────────
@@ -372,27 +528,35 @@ def build_slug(record_id, name_formula, fallback_name, product_code, existing_sl
 
 
 # ── Webflow helpers ───────────────────────────────────────────────────────
-def webflow_request(method, url, json_body=None, max_retries=5):
-    """Shared retry-with-backoff wrapper for every real (non-dry-run)
-    Webflow API call. Handles 429 (rate limit, respects Retry-After) and
-    5xx (transient) with exponential backoff. Raises with the real
+def webflow_request(method, url, json_body=None, params=None, max_retries=5, allow_404=False):
+    """Shared retry-with-backoff wrapper for EVERY Webflow API call in this
+    script — reads and writes alike. Handles 429 (rate limit, respects
+    Retry-After) and 5xx (transient) with backoff. Raises with the real
     response body on any other failure, or after retries are exhausted.
 
-    This exists because a single uncaught 429 killed a full production
-    run twice already (once in sync_garments before this wrapper existed,
-    once in sync_campaigns which hadn't been covered yet) — every Webflow
-    write in this script should go through here from now on, not call
-    requests directly."""
+    allow_404=True returns None on a 404 instead of raising — used by
+    webflow_get_item, where "item was deleted on the Webflow side" is an
+    expected condition that triggers a recreate, not an error.
+
+    This exists because a single uncaught 429 has now killed a full
+    production run three times (sync_garments before the wrapper existed,
+    sync_campaigns which hadn't been covered yet, and the slug-preload
+    pagination in webflow_all_items which was still calling requests.get
+    directly). No call site in this file may call requests.* against
+    api.webflow.com directly — everything goes through here."""
     for attempt in range(max_retries):
-        res = requests.request(method, url, headers=WEBFLOW_HEADERS, json=json_body, timeout=30)
+        res = requests.request(method, url, headers=WEBFLOW_HEADERS,
+                               json=json_body, params=params, timeout=30)
+        if allow_404 and res.status_code == 404:
+            return None
         if res.ok:
             return res
         if res.status_code == 429 or res.status_code >= 500:
             wait = int(res.headers.get("Retry-After", 5 * (attempt + 1)))
             print(f"  Webflow {res.status_code} on {method} {url} — waiting {wait}s, retry {attempt + 1}/{max_retries}")
-            time.sleep(wait)
+            time.sleep(wait + 1)  # +1s margin so we don't re-hit the window boundary exactly
             continue
-        # Non-retryable (400, 404, etc.) — fail immediately with detail
+        # Non-retryable (400, 404 when not allowed, etc.) — fail immediately with detail
         raise requests.exceptions.HTTPError(
             f"{res.status_code} on {method} {url}: {res.text[:500]} | payload: {json_body}",
             response=res,
@@ -422,20 +586,16 @@ def webflow_update_item(collection_id, item_id, field_data):
 
 
 def webflow_get_item(collection_id, item_id):
-    url = f"https://api.webflow.com/v2/collections/{collection_id}/items/{item_id}"
-    for attempt in range(5):
-        res = requests.get(url, headers=WEBFLOW_HEADERS, timeout=30)
-        if res.status_code == 404:
-            return None
-        if res.ok:
-            return res.json()
-        if res.status_code == 429 or res.status_code >= 500:
-            wait = int(res.headers.get("Retry-After", 5 * (attempt + 1)))
-            print(f"  Webflow {res.status_code} on GET {item_id} — waiting {wait}s, retry {attempt + 1}/5")
-            time.sleep(wait)
-            continue
-        res.raise_for_status()
-    raise requests.exceptions.HTTPError(f"Exhausted retries on GET {item_id} in {collection_id}")
+    """Fetch a single item. Returns None on 404 (item deleted on the
+    Webflow side — an expected condition, handled upstream by recreating
+    the item). Routed through webflow_request like everything else, so
+    429s here are retried instead of killing the run."""
+    res = webflow_request(
+        "GET",
+        f"https://api.webflow.com/v2/collections/{collection_id}/items/{item_id}",
+        allow_404=True,
+    )
+    return res.json() if res is not None else None
 
 
 def webflow_undraft_item(collection_id, item_id):
@@ -481,17 +641,32 @@ def webflow_site_publish():
 
 
 def webflow_all_items(collection_id):
+    """Paginate through every item in a collection.
+
+    Two rate-limit protections (see revision note 3 at the top of this
+    file — the unprotected version of this exact function is what killed
+    the last production run with a 429 at offset 2200):
+      1. Each page request goes through webflow_request(), so a 429 waits
+         out Retry-After and retries instead of raising.
+      2. A proactive WEBFLOW_PAGINATION_SLEEP between pages keeps the
+         fetch itself under ~54 req/min, so the retry path is a safety
+         net rather than the normal flow.
+    """
     items, offset, limit = [], 0, 100
     while True:
-        url = f"https://api.webflow.com/v2/collections/{collection_id}/items"
-        res = requests.get(url, headers=WEBFLOW_HEADERS, params={"limit": limit, "offset": offset}, timeout=30)
-        res.raise_for_status()
+        res = webflow_request(
+            "GET",
+            f"https://api.webflow.com/v2/collections/{collection_id}/items",
+            params={"limit": limit, "offset": offset},
+        )
         data = res.json()
-        items.extend(data.get("items", []))
+        page_items = data.get("items", [])
+        items.extend(page_items)
         total = data.get("pagination", {}).get("total", 0)
-        offset += len(data.get("items", []))
-        if offset >= total or not data.get("items"):
+        offset += len(page_items)
+        if offset >= total or not page_items:
             break
+        time.sleep(WEBFLOW_PAGINATION_SLEEP)
     return items
 
 
@@ -708,6 +883,13 @@ def sync_campaigns(qualifying_garments):
 
 # ── Step 5: sync Garments ─────────────────────────────────────────────────
 def sync_garments(qualifying_garments, campaign_webflow_ids, designer_webflow_ids):
+    if not qualifying_garments:
+        # Common on incremental runs with a quiet day in Airtable — skip
+        # the ~70-request slug preload entirely, there's nothing to
+        # collision-check against.
+        print("No garments to process this run — skipping slug preload and garment sync.")
+        return [], []
+
     print("Loading existing Webflow garment slugs for collision checking...")
     existing_items = webflow_all_items(GARMENTS_COLLECTION_ID)
     existing_slugs = {}
@@ -824,7 +1006,7 @@ def sync_garments(qualifying_garments, campaign_webflow_ids, designer_webflow_id
             print(f"  - {fail['airtable_id']} ({fail['name']}): {fail['error'][:200]}")
         if len(failures) > 20:
             print(f"  ...and {len(failures) - 20} more")
-    return synced
+    return synced, failures
 
 
 # ── Step 5: single site-wide publish ──────────────────────────────────────
@@ -834,11 +1016,32 @@ def publish_site():
     print("Publish complete.")
 
 
-# ── Step 6: garments.json export ──────────────────────────────────────────
+# ── Step 6: garments.json export (merge, not overwrite) ──────────────────
 def export_garments_json(synced_garments):
-    payload = []
+    """Merges this run's synced garments into the existing garments.json
+    rather than overwriting it. On an incremental run only a handful of
+    garments are processed — overwriting would shrink the search index
+    down to just that handful. Existing entries are kept as-is unless
+    this run produced a newer version of the same garment (keyed by
+    Airtable record ID). No removal pass: garments are create-once-
+    permanent, so entries never need to disappear."""
+    existing = []
+    try:
+        with open(GARMENTS_JSON_PATH) as fp:
+            existing = json.load(fp)
+        if not isinstance(existing, list):
+            print(f"WARNING: {GARMENTS_JSON_PATH} wasn't a list — starting fresh.")
+            existing = []
+    except FileNotFoundError:
+        pass  # first run / file not committed yet — fresh export
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"WARNING: couldn't read existing {GARMENTS_JSON_PATH} ({e}) — starting fresh.")
+        existing = []
+
+    merged = {g["id"]: g for g in existing if isinstance(g, dict) and g.get("id")}
+
     for g in synced_garments:
-        payload.append({
+        merged[g["airtable_id"]] = {
             "id": g["airtable_id"],
             "webflow_item_id": g["webflow_item_id"],
             "name": g["name"],
@@ -850,12 +1053,14 @@ def export_garments_json(synced_garments):
             "rrp": g["rrp"],
             "image": g["image_url"],
             "search": " ".join(filter(None, [g["designer"], g["name"], g["colour"], g["product_code"]])).lower(),
-        })
+        }
 
+    payload = list(merged.values())
     with open(GARMENTS_JSON_PATH, "w") as fp:
         json.dump(payload, fp, indent=2)
 
-    print(f"Wrote {len(payload)} garments to {GARMENTS_JSON_PATH}")
+    print(f"Wrote {len(payload)} garments to {GARMENTS_JSON_PATH} "
+          f"({len(synced_garments)} updated this run, {len(payload) - len(synced_garments)} carried over)")
 
 
 # ── Main ───────────────────────────────────────────────────────────────────
@@ -863,6 +1068,13 @@ def main():
     print("=== webflow_sync.py — starting ===")
     if DRY_RUN:
         print("*** DRY RUN MODE — no Webflow/Airtable/KV writes will actually happen ***")
+
+    # Captured BEFORE any Airtable fetch — this becomes the next run's
+    # cutoff, so records edited while this run is in flight fall on the
+    # right side of the window next time (they may just get synced twice,
+    # which is harmless).
+    run_started_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    last_sync_iso = read_last_sync_timestamp()
 
     in_feed_designers = get_in_feed_designers()
     if not in_feed_designers:
@@ -874,9 +1086,30 @@ def main():
         print("No qualifying garments found — aborting, this looks wrong.")
         sys.exit(1)
 
+    # Campaigns/Designers ALWAYS sync from the FULL qualifying set —
+    # they're a few dozen items, and campaign scope must not depend on
+    # which garments happen to be in this run's modified window (or a
+    # campaign referenced only by unmodified garments would silently
+    # stop receiving updates).
     campaign_webflow_ids = sync_campaigns(qualifying_garments)
     designer_webflow_ids = sync_designers()
-    synced_garments = sync_garments(qualifying_garments, campaign_webflow_ids, designer_webflow_ids)
+
+    # Garments sync INCREMENTALLY: only ones modified since the last
+    # successful run (per field-scoped LAST_MODIFIED_TIME) or never yet
+    # created in Webflow. See revision note 4.
+    if last_sync_iso:
+        modified_ids = get_modified_garment_ids(last_sync_iso)
+        garments_to_process = [r for r in qualifying_garments if r["id"] in modified_ids]
+        print(f"Incremental mode (since {last_sync_iso}): "
+              f"{len(garments_to_process)} of {len(qualifying_garments)} qualifying garments "
+              f"modified/new — the rest are skipped.")
+    else:
+        garments_to_process = qualifying_garments
+        print(f"Full-sync mode: all {len(garments_to_process)} qualifying garments will be processed.")
+
+    synced_garments, garment_failures = sync_garments(
+        garments_to_process, campaign_webflow_ids, designer_webflow_ids
+    )
 
     # Export garments.json FIRST — this data is valuable on its own and
     # shouldn't be held hostage by an unrelated publish failure (which is
@@ -884,6 +1117,17 @@ def main():
     # json export — the very last line of the script — never ran at all,
     # despite ~5,478 garments having synced successfully beforehand).
     export_garments_json(synced_garments)
+
+    # Advance the incremental cutoff ONLY if every garment in this run's
+    # window succeeded — otherwise keep the old timestamp so the failed
+    # ones land back inside the modified window next run and get retried
+    # automatically (the successful ones in the same window just get
+    # re-updated once, which is harmless).
+    if not garment_failures:
+        write_last_sync_timestamp(run_started_iso)
+    else:
+        print(f"NOT advancing {LAST_SYNC_PATH}: {len(garment_failures)} garment failure(s) — "
+              f"this window will be retried in full on the next run.")
 
     try:
         publish_site()
