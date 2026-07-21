@@ -29,6 +29,18 @@ on:
         default: 'false'
 permissions:
   contents: write   # needed so the commit-back-to-repo step can push
+concurrency:
+  # Serialises runs so a scheduled sync can never start while a previous
+  # one (especially a slow FULL_SYNC=true run, ~4h) is still in flight.
+  # Without this, two runs can both reach the "commit garments.json" step
+  # around the same time and race to push — the loser's changes are lost
+  # outright once its rebase hits a conflict in the generated JSON file,
+  # which Git can't merge line-by-line. cancel-in-progress: false means a
+  # second run WAITS for the first to finish rather than killing it —
+  # never cancel a sync partway through, since Webflow/Airtable/Supabase
+  # writes already happened and can't be rolled back.
+  group: webflow-sync
+  cancel-in-progress: false
 jobs:
   sync:
     runs-on: ubuntu-latest
