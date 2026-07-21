@@ -17,6 +17,37 @@ were missing from the plain rewrite of this script:
      record. If so, that existing record is reactivated (Status -> Active,
      refreshed URL/price/end date) instead of creating a duplicate — this
      is what preserves a garment match across an expire-then-relist cycle.
+
+--------------------------------------------------------------------------
+2026-07 REVISION NOTES (non-AU listing slipped through):
+
+3. A US-located listing was found synced into Airtable despite this
+   script being AU-only by design (EBAY_WOMENS_CAT under the AU category
+   tree, "itemLocationCountry:AU" in the Browse API filter string,
+   priceCurrency:AUD, and the EBAY_AU marketplace header). The root
+   cause: search_ebay()'s "itemLocationCountry:AU" filter was trusted as
+   authoritative and NOTHING downstream ever re-checked a listing's
+   actual location once eBay returned it.
+
+   eBay's Browse API filters are best-effort, not a hard guarantee —
+   sellers self-report itemLocationCountry, it can be blank/stale/wrong,
+   and Global Shipping Program listings in particular can appear in the
+   AU marketplace's results while their true itemLocation is overseas.
+   A missing or inconsistent field on eBay's side can silently pass
+   through a filter that has nothing concrete to compare against.
+
+   Fixed with a local, independent second check: parse_item() now reads
+   raw["itemLocation"]["country"] directly off each Browse API result,
+   and any item whose reported country is present AND not "AU" is
+   excluded before it ever reaches garment matching or Airtable — same
+   place as the existing title/condition exclusion checks, so it's
+   counted and logged the same way. An item with a BLANK/missing
+   location field is not auto-excluded (there's nothing to check it
+   against), so this is a strict improvement, not a guarantee — treat
+   eBay's own filter as the first pass and this as the safety net, not
+   as making the AU-only requirement airtight against a seller who
+   simply never fills the field in.
+--------------------------------------------------------------------------
 """
 
 import os, re, requests, time, base64
@@ -36,6 +67,13 @@ EBAY_CLIENT_SECRET  = os.environ["EBAY_CLIENT_SECRET"]
 EBAY_WOMENS_CAT     = "15724"    # eBay AU: Women's Clothing — no other categories
 LOOKBACK_HOURS      = 72         # Runs twice daily, 14hr window with overlap
 MAX_PER_DESIGNER    = 100        # Cap per designer per run
+
+# Listings must genuinely be located in Australia. eBay's own
+# itemLocationCountry filter (in search_ebay() below) is the first pass;
+# this is the authoritative value this script itself requires, checked
+# again locally in parse_item()/is_wrong_country() rather than trusted
+# purely server-side — see 2026-07 revision notes above.
+REQUIRED_ITEM_COUNTRY = "AU"
 
 # ── Matching thresholds (unchanged from the original working Colab logic) ────
 AUTO_MATCH_THRESHOLD = 0.65
@@ -333,6 +371,18 @@ def is_excluded_condition(condition):
     return condition in EXCLUDED_CONDITIONS
 
 
+def is_wrong_country(location_country):
+    """2026-07 addition — local, independent check on top of eBay's own
+    itemLocationCountry search filter (which is best-effort, not a hard
+    guarantee — see revision notes at the top of this file). A BLANK
+    location_country is NOT treated as wrong — there's nothing to check
+    it against, so this can only catch listings that positively report a
+    non-AU location, not ones that omit it entirely."""
+    if not location_country:
+        return False
+    return location_country.strip().upper() != REQUIRED_ITEM_COUNTRY
+
+
 def parse_item(raw, designer_name):
     raw_id  = raw.get("itemId", "")
     parts   = raw_id.split("|")
@@ -345,6 +395,12 @@ def parse_item(raw, designer_name):
     price_val = raw.get("price", {}).get("value")
     date_str  = raw.get("itemCreationDate", "")
     condition = raw.get("condition", "")
+
+    # Independent local check — see is_wrong_country() and the 2026-07
+    # revision notes at the top of this file. Browse API item summaries
+    # expose this as itemLocation.country (ISO 3166-1 alpha-2, e.g. "AU",
+    # "US", "GB") when the seller has set a location at all.
+    location_country = raw.get("itemLocation", {}).get("country", "")
 
     try:
         price = float(price_val) if price_val else None
@@ -359,15 +415,16 @@ def parse_item(raw, designer_name):
         date_listed = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     return {
-        "item_id":     item_id.strip(),
-        "title":       title,
-        "url":         url,
-        "price":       price,
-        "image_url":   image_url,
-        "date_listed": date_listed,
-        "seller":      seller,
-        "designer":    designer_name,
-        "condition":   condition,
+        "item_id":          item_id.strip(),
+        "title":            title,
+        "url":              url,
+        "price":            price,
+        "image_url":        image_url,
+        "date_listed":      date_listed,
+        "seller":           seller,
+        "designer":         designer_name,
+        "condition":        condition,
+        "location_country": location_country,
     }
 
 
@@ -410,6 +467,7 @@ def main():
     all_new = []
     total_found = total_old = total_excluded = total_dupes = total_bad_condition = 0
     total_relisted = total_auto_matched = total_needs_review = total_no_match = 0
+    total_wrong_country = 0
 
     print(f"\n🔍 Searching eBay AU (last {LOOKBACK_HOURS}hrs)...")
     for designer in designers:
@@ -424,6 +482,12 @@ def main():
                 continue
 
             item = parse_item(raw, designer)
+
+            if is_wrong_country(item["location_country"]):
+                total_wrong_country += 1
+                print(f"   ⚠️  Excluded non-AU listing: {item['item_id']} "
+                      f"(location={item['location_country']!r}) — {item['title'][:60]!r}")
+                continue
 
             if is_excluded(item["title"]):
                 total_excluded += 1
@@ -463,7 +527,8 @@ def main():
         time.sleep(0.5)
 
     print(f"\n   Total found: {total_found} | Too old: {total_old} | Excluded: {total_excluded} | "
-          f"Bad condition: {total_bad_condition} | Relisted: {total_relisted} | New: {len(all_new)}")
+          f"Bad condition: {total_bad_condition} | Wrong country: {total_wrong_country} | "
+          f"Relisted: {total_relisted} | New: {len(all_new)}")
 
     if all_new:
         print(f"\n🔗 Matching {len(all_new)} new listings to garments...")
