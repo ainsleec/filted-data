@@ -132,6 +132,44 @@ placeholder to verify, not a confirmed value.
    WORKFLOW CHANGE REQUIRED: the GitHub Actions workflow must commit
    webflow_last_sync.txt alongside garments.json after the run, or every
    run will be a full sync forever.
+
+--------------------------------------------------------------------------
+2026-07 REVISION NOTES (image_url never reached Supabase):
+
+5. garments.image_url in Supabase was null for EVERY garment, real or
+   otherwise — this was the root cause of broken image icons across the
+   /find search results page (surfaced 2026-07-21 debugging the "senses"
+   duplicate-card issue, which turned out to be a separate Airtable-side
+   duplication bug — see the cleanup done directly in Supabase for that).
+
+   field_data[WF_FIELD_IMAGE_1] was always being sent TO Webflow on every
+   create/update, but nothing ever wrote the resulting URL back to
+   Supabase — update_supabase_garment_slug() only ever touched the slug
+   column. Fixed by adding update_supabase_garment_image(), called
+   alongside the slug update on every garment.
+
+   While fixing this, found a second, subtler bug in the same area: the
+   local `image_url` variable was being set from Airtable's OWN
+   attachment URL (f.get(FLD_IMAGE_1)[0]["url"]) — a signed URL that
+   Airtable expires after a period — not from Webflow's actual hosted
+   CDN URL, despite a comment in this file explicitly claiming it was
+   "Webflow's own asset URL — permanent, no expiry." That claim wasn't
+   true. This also affected garments.json, which has been shipping the
+   same expiring URL to every consumer of that file, silently, since it
+   was first written.
+
+   Fixed by reading the real Webflow-hosted URL back out of the
+   create/update API response (Webflow echoes the resolved CDN URL in
+   fieldData once an image is attached) and using THAT as the canonical
+   image_url for both the Supabase write-back and the garments.json
+   export — falling back to the Airtable URL only in DRY_RUN, where no
+   real Webflow write happens and there's nothing else to fall back to.
+
+   This is an incremental-sync-safe fix: on the next real run, only
+   garments already flagged as modified/new get reprocessed and get a
+   correct image_url; use FULL_SYNC=true once to backfill image_url for
+   every already-synced garment in one pass, since normal incremental
+   runs won't touch untouched historical rows.
 --------------------------------------------------------------------------
 """
 
@@ -414,6 +452,28 @@ def update_supabase_garment_slug(supabase_uuid, slug):
     res = requests.patch(url, headers=SUPABASE_HEADERS, json={"slug": slug}, timeout=15)
     if not res.ok:
         print(f"  WARNING: failed to update Supabase slug for {supabase_uuid}: {res.status_code} {res.text[:200]}")
+
+
+def update_supabase_garment_image(supabase_uuid, image_url):
+    """Keeps Supabase's garments.image_url in sync on every run — same
+    best-effort pattern as update_supabase_garment_slug (log-and-continue
+    on failure, never fail the garment).
+
+    2026-07 FIX: this call didn't exist before. field_data[WF_FIELD_IMAGE_1]
+    was being sent TO Webflow on every create/update, but the resulting
+    URL was never written back to Supabase, so garments.image_url sat
+    null forever and search_garments()/the /find results page rendered
+    broken image icons on every card — including for garments that were
+    correctly synced in every other respect."""
+    if not image_url:
+        return
+    if DRY_RUN:
+        print(f"  [DRY RUN] would update Supabase garments.image_url for {supabase_uuid} -> {image_url}")
+        return
+    url = f"{SUPABASE_URL}/rest/v1/garments?id=eq.{supabase_uuid}"
+    res = requests.patch(url, headers=SUPABASE_HEADERS, json={"image_url": image_url}, timeout=15)
+    if not res.ok:
+        print(f"  WARNING: failed to update Supabase image_url for {supabase_uuid}: {res.status_code} {res.text[:200]}")
 
 
 # ── Cloudflare KV helper (redirects) ─────────────────────────────────────
@@ -959,16 +1019,33 @@ def sync_garments(qualifying_garments, campaign_webflow_ids, designer_webflow_id
 
             if existing_item:
                 old_slug = existing_item.get("fieldData", {}).get(WF_FIELD_SLUG)
-                webflow_update_item(GARMENTS_COLLECTION_ID, existing_wf_id, field_data)
+                update_res = webflow_update_item(GARMENTS_COLLECTION_ID, existing_wf_id, field_data)
                 wf_item_id = existing_wf_id
                 if old_slug and old_slug != new_slug:
                     kv_write_redirect(old_slug, new_slug)
                     print(f"  Slug changed: {old_slug} -> {new_slug} (redirect written)")
             else:
-                created = webflow_create_item(GARMENTS_COLLECTION_ID, field_data)
-                wf_item_id = created["id"]
+                update_res = webflow_create_item(GARMENTS_COLLECTION_ID, field_data)
+                wf_item_id = update_res["id"]
                 airtable_update(GARMENTS_TABLE, airtable_id, {FLD_WEBFLOW_ITEM_ID: wf_item_id})
                 webflow_undraft_item(GARMENTS_COLLECTION_ID, wf_item_id)
+
+            # 2026-07 FIX: use Webflow's own hosted CDN URL for the image,
+            # not the Airtable attachment URL computed above. Airtable
+            # attachment URLs are signed and expire — they are NOT the
+            # "permanent, no expiry" asset the rest of this pipeline
+            # (garments.json, Supabase) assumes. Webflow's response
+            # echoes back the real, permanent CDN URL once the image has
+            # been created/updated, so prefer that whenever it's present;
+            # fall back to the Airtable URL only if Webflow's response is
+            # missing it for some reason (e.g. DRY_RUN, where no real
+            # Webflow write happened).
+            webflow_image_url = (update_res or {}).get("fieldData", {}).get(WF_FIELD_IMAGE_1, {})
+            if isinstance(webflow_image_url, dict) and webflow_image_url.get("url"):
+                image_url = webflow_image_url["url"]
+
+            if supabase_uuid:
+                update_supabase_garment_image(supabase_uuid, image_url)
 
             # Register this slug immediately so a later garment in the same
             # run — including any that previously collided with THIS one
@@ -986,7 +1063,10 @@ def sync_garments(qualifying_garments, campaign_webflow_ids, designer_webflow_id
                 "category": f.get(FLD_CATEGORY, ""),
                 "colour": f.get(FLD_PRODUCT_COLOUR, ""),
                 "rrp": f.get(FLD_RRP),
-                # Webflow's own asset URL — permanent, no expiry, no Supabase Storage needed
+                # Webflow's own hosted CDN asset URL — permanent, no
+                # expiry, no Supabase Storage needed. (Prior to the
+                # 2026-07 fix this was actually Airtable's signed,
+                # expiring attachment URL — see note above.)
                 "image_url": image_url,
             })
 
