@@ -170,6 +170,41 @@ placeholder to verify, not a confirmed value.
    correct image_url; use FULL_SYNC=true once to backfill image_url for
    every already-synced garment in one pass, since normal incremental
    runs won't touch untouched historical rows.
+
+--------------------------------------------------------------------------
+2026-07 REVISION NOTES (garment duplication — Airtable write-back gap):
+
+6. Root cause of duplicate Webflow garment items (same Name, different
+   slug, both live): the create path calls webflow_create_item() (which
+   IS retry-protected via webflow_request()) and then immediately calls
+   airtable_update() to write the new Webflow Item ID back onto the
+   Airtable record — but airtable_update() was a bare requests.patch()
+   with no retry handling at all. Airtable's own rate limit (5 req/sec)
+   is easy to hit during a run that's also hitting Webflow and Supabase
+   in the same loop.
+
+   When that write-back PATCH failed, the garment landed in `failures`,
+   which meant webflow_last_sync.txt did NOT advance — so the garment
+   stayed inside the "modified/blank ID" window for the next run. That
+   next run saw a blank Webflow Item ID in Airtable (because the write-
+   back never landed) and treated the garment as never-created, calling
+   build_slug() with self_wf_id=None. build_slug() correctly saw the base
+   slug already taken in the live-slugs map, but since self_wf_id was
+   None it couldn't recognize the taken slug as "itself" — so it fell
+   through to the numeric-suffix fallback and created a SECOND Webflow
+   item: same visible Name, different slug.
+
+   Fixed two ways:
+   a. airtable_request()/airtable_update() now retry on 429/5xx with the
+      same backoff pattern webflow_request() already uses, so a
+      transient rate-limit hit no longer silently drops the write-back.
+   b. Defensive fallback in sync_garments(): before creating a new item,
+      if the computed slug is already present in the live-slugs map
+      (loaded once per run for collision detection anyway), that item is
+      adopted as "existing" and updated in place instead of a duplicate
+      being created — and the recovered ID is written straight back to
+      Airtable. This closes the gap even for some other future failure
+      mode that leaves Airtable's ID blank while a live item exists.
 --------------------------------------------------------------------------
 """
 
@@ -326,6 +361,34 @@ WEBFLOW_PAGINATION_SLEEP = 1.1
 
 
 # ── Airtable helpers ─────────────────────────────────────────────────────
+def airtable_request(method, url, json_body=None, params=None, max_retries=5):
+    """Shared retry-with-backoff wrapper for Airtable writes — mirrors
+    webflow_request()'s handling of 429/5xx. Added 2026-07 after tracing
+    the garment-duplication bug back to this call having NO retry
+    protection: a transient Airtable rate-limit hit here would silently
+    drop the Webflow-Item-ID write-back after a successful create,
+    leaving Airtable's field blank even though a live Webflow item
+    existed — which caused the next run to create a second item for the
+    same garment (see revision note 6 at the top of this file)."""
+    for attempt in range(max_retries):
+        res = requests.request(method, url, headers=AIRTABLE_HEADERS,
+                               json=json_body, params=params, timeout=30)
+        if res.ok:
+            return res
+        if res.status_code == 429 or res.status_code >= 500:
+            wait = int(res.headers.get("Retry-After", 5 * (attempt + 1)))
+            print(f"  Airtable {res.status_code} on {method} {url} — waiting {wait}s, retry {attempt + 1}/{max_retries}")
+            time.sleep(wait + 1)  # +1s margin so we don't re-hit the window boundary exactly
+            continue
+        raise requests.exceptions.HTTPError(
+            f"{res.status_code} on {method} {url}: {res.text[:500]} | payload: {json_body}",
+            response=res,
+        )
+    raise requests.exceptions.HTTPError(
+        f"Exhausted {max_retries} retries on {method} {url} (repeated 429/5xx): {json_body}"
+    )
+
+
 def airtable_fetch_all(table, filter_formula=None, fields=None):
     url = f"https://api.airtable.com/v0/{AIRTABLE_BASE}/{requests.utils.quote(table)}"
     records, offset = [], None
@@ -363,12 +426,18 @@ def airtable_fetch_all(table, filter_formula=None, fields=None):
 
 
 def airtable_update(table, record_id, fields):
+    """Writes back to Airtable (e.g. a new Webflow Item ID after create).
+    Now routed through airtable_request() for 429/5xx retry — see
+    revision note 6. This call used to be a bare requests.patch() with no
+    retry handling at all, which was the actual root cause of the garment
+    duplication bug: a dropped write-back here left Airtable's Webflow
+    Item ID blank even though the Webflow item had been created
+    successfully, so the next run treated the garment as never-created."""
     if DRY_RUN:
         print(f"  [DRY RUN] would update Airtable {table}/{record_id} with {fields}")
         return {"id": record_id, "fields": fields}
     url = f"https://api.airtable.com/v0/{AIRTABLE_BASE}/{requests.utils.quote(table)}/{record_id}"
-    res = requests.patch(url, headers=AIRTABLE_HEADERS, json={"fields": fields}, timeout=30)
-    res.raise_for_status()
+    res = airtable_request("PATCH", url, json_body={"fields": fields})
     return res.json()
 
 
@@ -978,6 +1047,28 @@ def sync_garments(qualifying_garments, campaign_webflow_ids, designer_webflow_id
             )
 
             existing_item = webflow_get_item(GARMENTS_COLLECTION_ID, existing_wf_id) if existing_wf_id else None
+
+            # DEFENSIVE FALLBACK (2026-07, revision note 6): Airtable's
+            # Webflow Item ID can be blank even when a live Webflow item
+            # already exists for this exact slug — this happens if a
+            # prior run created the item but the write-back PATCH to
+            # Airtable failed (rate limit, network blip, etc.) before
+            # airtable_update() had retry protection. Rather than blindly
+            # creating a second item, check the live-slugs map we already
+            # loaded above for collision detection: if new_slug is
+            # already owned by a real Webflow item, adopt that item as
+            # "existing" instead of creating a duplicate.
+            if not existing_item and new_slug in existing_slugs:
+                adopted_wf_id = existing_slugs[new_slug]
+                existing_item = webflow_get_item(GARMENTS_COLLECTION_ID, adopted_wf_id)
+                if existing_item:
+                    existing_wf_id = adopted_wf_id
+                    print(f"  RECOVERED: garment {airtable_id} had blank Webflow Item ID but "
+                          f"slug '{new_slug}' already exists as {adopted_wf_id} — adopting "
+                          f"instead of creating a duplicate.")
+                    # Write the recovered ID back to Airtable right away
+                    # so this recovery only has to happen once per garment.
+                    airtable_update(GARMENTS_TABLE, airtable_id, {FLD_WEBFLOW_ITEM_ID: adopted_wf_id})
 
             supabase_uuid = get_supabase_garment_uuid(airtable_id)  # may be None — see module docstring
             if supabase_uuid:
