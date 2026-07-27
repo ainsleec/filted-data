@@ -1,0 +1,68 @@
+name: Find & Clean Webflow Garment Duplicates
+
+# Manual-only — this should never run on a schedule. You trigger it from
+# the Actions tab (or `gh workflow run`), pick a mode, and — for the
+# delete mode — type a literal confirmation phrase, since Actions has no
+# terminal for the script's normal input() prompt to work against.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "report = list duplicates only (safe, no writes). delete = actually delete duplicates."
+        required: true
+        type: choice
+        options:
+          - report
+          - delete
+        default: report
+      confirm:
+        description: "Only checked for mode=delete. Must be exactly: DELETE DUPLICATES"
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Guard against unconfirmed delete
+        if: ${{ inputs.mode == 'delete' && inputs.confirm != 'DELETE DUPLICATES' }}
+        run: |
+          echo "::error::mode=delete requires the 'confirm' input to be exactly 'DELETE DUPLICATES'. Aborting — nothing was touched."
+          exit 1
+
+      - name: Run report only
+        if: ${{ inputs.mode == 'report' }}
+        env:
+          AIRTABLE_TOKEN: ${{ secrets.AIRTABLE_TOKEN }}
+          WEBFLOW_API_TOKEN: ${{ secrets.WEBFLOW_API_TOKEN }}
+        run: python3 find_and_clean_webflow_duplicates.py
+
+      - name: Run report + delete (confirmed)
+        if: ${{ inputs.mode == 'delete' && inputs.confirm == 'DELETE DUPLICATES' }}
+        env:
+          AIRTABLE_TOKEN: ${{ secrets.AIRTABLE_TOKEN }}
+          WEBFLOW_API_TOKEN: ${{ secrets.WEBFLOW_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_KV_NAMESPACE_ID: ${{ secrets.CLOUDFLARE_KV_NAMESPACE_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: python3 find_and_clean_webflow_duplicates.py --delete --yes
+
+      - name: Upload duplicate report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: webflow-duplicate-report
+          path: webflow_duplicate_report.json
+          if-no-files-found: warn
