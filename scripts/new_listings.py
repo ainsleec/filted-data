@@ -47,6 +47,16 @@ were missing from the plain rewrite of this script:
    eBay's own filter as the first pass and this as the safety net, not
    as making the AU-only requirement airtight against a seller who
    simply never fills the field in.
+
+4. Blocked Sellers support added. There is a "Blocked Sellers" table in
+   Airtable (single "Seller Name" field per row) that Ainslee maintains
+   by hand for sellers she never wants surfaced (fakes, spam, repeat bad
+   matches, whatever the reason). This script now pulls that table each
+   run and excludes any listing from a blocked seller BEFORE relist
+   detection, dedup, or garment matching — same tier as the title/
+   condition/country checks, so it's counted the same way. Matching is
+   case-insensitive and trimmed, since eBay usernames are stored with
+   inconsistent casing in different places.
 --------------------------------------------------------------------------
 """
 
@@ -54,11 +64,12 @@ import os, re, requests, time, base64
 from datetime import datetime, timezone, timedelta
 
 # ── Config ────────────────────────────────────────────────────────────────────
-AIRTABLE_TOKEN      = os.environ["AIRTABLE_TOKEN"]
-AIRTABLE_BASE       = os.environ["AIRTABLE_BASE"]
-DESIGNERS_TABLE     = os.environ.get("DESIGNERS_TABLE", "Designers")
-SIGHTINGS_TABLE     = os.environ["RESALE_SIGHTINGS_TABLE"]
-GARMENTS_TABLE_ID   = "tblmqjU4WqgCzP7cR"
+AIRTABLE_TOKEN        = os.environ["AIRTABLE_TOKEN"]
+AIRTABLE_BASE         = os.environ["AIRTABLE_BASE"]
+DESIGNERS_TABLE       = os.environ.get("DESIGNERS_TABLE", "Designers")
+SIGHTINGS_TABLE       = os.environ["RESALE_SIGHTINGS_TABLE"]
+GARMENTS_TABLE_ID     = "tblmqjU4WqgCzP7cR"
+BLOCKED_SELLERS_TABLE = os.environ.get("BLOCKED_SELLERS_TABLE", "Blocked Sellers")
 
 EBAY_CLIENT_ID      = os.environ["EBAY_CLIENT_ID"]
 EBAY_CLIENT_SECRET  = os.environ["EBAY_CLIENT_SECRET"]
@@ -202,6 +213,19 @@ def fetch_existing_sightings():
         SIGHTINGS_TABLE,
         fields=["Listing URL", "eBay Item ID", "Status", "Seller Name", "eBay Title"]
     )
+
+
+def fetch_blocked_sellers():
+    """Load the hand-maintained Blocked Sellers table (single 'Seller Name'
+    field per row). Returns a set of lowercased/trimmed usernames so lookups
+    match regardless of casing inconsistencies between eBay and Airtable."""
+    records = at_list_all(BLOCKED_SELLERS_TABLE, fields=["Seller Name"])
+    blocked = set()
+    for rec in records:
+        name = (rec["fields"].get("Seller Name") or "").strip().lower()
+        if name:
+            blocked.add(name)
+    return blocked
 
 
 # ── Matching (ported from the original working Colab logic) ──────────────────
@@ -383,6 +407,15 @@ def is_wrong_country(location_country):
     return location_country.strip().upper() != REQUIRED_ITEM_COUNTRY
 
 
+def is_blocked_seller(seller, blocked_sellers):
+    """Checks the current listing's seller username against the hand-
+    maintained Blocked Sellers Airtable table (loaded once per run into
+    a lowercased/trimmed set — see fetch_blocked_sellers())."""
+    if not seller:
+        return False
+    return seller.strip().lower() in blocked_sellers
+
+
 def parse_item(raw, designer_name):
     raw_id  = raw.get("itemId", "")
     parts   = raw_id.split("|")
@@ -449,6 +482,10 @@ def main():
     garments = fetch_garments()
     print(f"   {len(garments)} garments loaded")
 
+    print("\n🚫 Fetching blocked sellers from Airtable...")
+    blocked_sellers = fetch_blocked_sellers()
+    print(f"   {len(blocked_sellers)} blocked seller(s)")
+
     print("\n🗂  Loading existing sightings (dedup + relist lookup)...")
     existing = fetch_existing_sightings()
     existing_ids = set()
@@ -467,7 +504,7 @@ def main():
     all_new = []
     total_found = total_old = total_excluded = total_dupes = total_bad_condition = 0
     total_relisted = total_auto_matched = total_needs_review = total_no_match = 0
-    total_wrong_country = 0
+    total_wrong_country = total_blocked_seller = 0
 
     print(f"\n🔍 Searching eBay AU (last {LOOKBACK_HOURS}hrs)...")
     for designer in designers:
@@ -487,6 +524,10 @@ def main():
                 total_wrong_country += 1
                 print(f"   ⚠️  Excluded non-AU listing: {item['item_id']} "
                       f"(location={item['location_country']!r}) — {item['title'][:60]!r}")
+                continue
+
+            if is_blocked_seller(item["seller"], blocked_sellers):
+                total_blocked_seller += 1
                 continue
 
             if is_excluded(item["title"]):
@@ -528,7 +569,7 @@ def main():
 
     print(f"\n   Total found: {total_found} | Too old: {total_old} | Excluded: {total_excluded} | "
           f"Bad condition: {total_bad_condition} | Wrong country: {total_wrong_country} | "
-          f"Relisted: {total_relisted} | New: {len(all_new)}")
+          f"Blocked seller: {total_blocked_seller} | Relisted: {total_relisted} | New: {len(all_new)}")
 
     if all_new:
         print(f"\n🔗 Matching {len(all_new)} new listings to garments...")
