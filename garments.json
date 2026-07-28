@@ -7651,10 +7651,10 @@
     "designer": "Aje",
     "category": "Dresses",
     "colour": "Ivory",
-    "product_code": "",
+    "product_code": "24RE5523",
     "rrp": null,
     "image": "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a4ee2ba4fb6c33ffe0a900e_kjVSfL8MPzrH6wRre6i2IJf-eKvjWMsdeQ6n9PQ-5Mg.jpeg",
-    "search": "aje synergy frill midi dress - ivory ivory"
+    "search": "aje synergy frill midi dress - ivory ivory 24re5523"
   },
   {
     "id": "rec5DsVMYSRTkZn9C",
@@ -18662,10 +18662,10 @@
     "designer": "Aje",
     "category": "Tops",
     "colour": "White",
-    "product_code": "",
+    "product_code": "22RE1946",
     "rrp": 275,
     "image": "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a52ca95e8bd9ded3c830d2d_IMObP6SE9iqqk11LLOB1OObln00ym4h9b8iAiLOIbLM.jpeg",
-    "search": "aje ember denim crop shirt - white white"
+    "search": "aje ember denim crop shirt - white white 22re1946"
   },
   {
     "id": "recD0hrYzdg5Eah5v",
@@ -40979,14 +40979,14 @@
     "id": "recSLkb5IROQKbIJJ",
     "webflow_item_id": "6a52e38831b79a38373c9aef",
     "name": "Dominique Knit Jumper - Rose Pink",
-    "slug": "dominique-knit-jumper-rose-pink-2",
+    "slug": "dominique-knit-jumper-rose-pink-21ss1131",
     "designer": "Aje",
     "category": "Jumpers & Knitwear",
     "colour": "Rose Pink",
-    "product_code": "",
+    "product_code": "21SS1131",
     "rrp": 355,
     "image": "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a52d8d9686a4f26d7d0daa4_rJB3NJFsDKRD5Bd2mZtv1lcKZXm5sE_QpFGduf_ab_g.jpeg",
-    "search": "aje dominique knit jumper - rose pink rose pink"
+    "search": "aje dominique knit jumper - rose pink rose pink 21ss1131"
   },
   {
     "id": "recSMJdelS7ekBVNo",
@@ -44905,14 +44905,14 @@
     "id": "recUhVFRDx4LRLXDA",
     "webflow_item_id": "6a52e5e231b79a38373de890",
     "name": "Grace Tiered Mini Dress  - Black",
-    "slug": "grace-tiered-mini-dress-black-2",
+    "slug": "grace-tiered-mini-dress-black-22ss5455",
     "designer": "Aje",
     "category": "Other",
     "colour": "Black",
-    "product_code": "",
-    "rrp": 0,
+    "product_code": "22SS5455",
+    "rrp": 345,
     "image": "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a52dbd7663f294b1b2b4f8b_pF_o031K9fCzEEdDEkiE5zqshJMn8PcpkiTro5vOOhM.webp",
-    "search": "aje grace tiered mini dress  - black black"
+    "search": "aje grace tiered mini dress  - black black 22ss5455"
   },
   {
     "id": "recUiCLMZFjGdquKh",
@@ -55877,14 +55877,14 @@
     "id": "reccVHBK0CDZnUZeT",
     "webflow_item_id": "6a52ec8992429119072716f1",
     "name": "Oliver Coat - Camel  ",
-    "slug": "oliver-coat-camel-2",
+    "slug": "oliver-coat-camel-19aj2019",
     "designer": "Aje",
     "category": "Coats & Jackets",
     "colour": "Camel  ",
-    "product_code": "",
+    "product_code": "19AJ2019",
     "rrp": 0,
     "image": "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a6090413d4f4b70502b9dca_XhnQ84gfE43DBEuAOnTOk6y2Wnmerrt1JHW2zsrBOUQ.jpeg",
-    "search": "aje oliver coat - camel   camel  "
+    "search": "aje oliver coat - camel   camel   19aj2019"
   },
   {
     "id": "reccVe0NOU1OJhyhR",
@@ -94235,5 +94235,135 @@
     "rrp": 295,
     "image": "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a67619f4e7d50a72868dc79_hNcpWDfsOt2vNmFsv-3jbfp2g-qIPBdgLVeRRWEz4CA.webp",
     "search": "aje flame crop top - guava pink guava pink 24re1424"
+  },
+  {
+    "id": "rec3QP6Mq4Fj8FWo3",
+    "webflow_item_id": "6a687ae4c65a1dc00fecc6ed",
+    "name": "Florence Wrap Dress - Vine Print",
+    "slug": "florence-wrap-dress-vine-print",
+    "designer": "Aje",
+    "category": "Dresses",
+    "colour": "Vine Print",
+    "product_code": "",
+    "rrp": 0,
+    "image": "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a687ae3c65a1dc00fecc6b9_uwKcKupgRidf9y5nVh_f-FzyuVfJieFTqcfxAjgxpIc.jpeg",
+    "search": "aje florence wrap dress - vine print vine print"
+  },
+  {
+    "id": "recB98syPjSsa2zwA",
+    "webflow_item_id": "6a687aeb9ec2244a7efc52b2",
+    "name": "Drift Le Corsaire Blouse - Botanic Floral",
+    "slug": "drift-le-corsaire-blouse-botanic-floral",
+    "designer": "Aje",
+    "category": "Tops",
+    "colour": "Botanic Floral",
+    "product_code": "22SU1449",
+    "rrp": 275,
+    "image": "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a687aeb9ec2244a7efc5270_CN0kkBGq12VhlMtIKkNsH3WBJIIiiSJhdvwRhmsOtzc.webp",
+    "search": "aje drift le corsaire blouse - botanic floral botanic floral 22su1449"
+  },
+  {
+    "id": "recIWeMzarX10ift5",
+    "webflow_item_id": "6a687af25ac86286dfb2fb4a",
+    "name": "Ondine Knit Midi Dress - Olive",
+    "slug": "ondine-knit-midi-dress-olive",
+    "designer": "Aje",
+    "category": "Dresses",
+    "colour": "Olive",
+    "product_code": "",
+    "rrp": null,
+    "image": "https://v5.airtableusercontent.com/v3/u/55/55/1785240000000/cZDqdXASMM1W7bBdMlE94A/FbnFb7TwEKDfLxf7x-T-d0vPEDk-bAgBjIHKCIcvzec1Va19z_0to67zV4ReATxdDboYBv1hx2BkkdqiKb_FCo2zzqXp6BX5iuuUtR8pgBYshRheUvcojSUO9HTxk6pSYRFRpNjI8TKpUC3DzJBvHwy6XRksl1H9Oz5yQuhBkvE/_dUf7ET6noSvXgfEj6gL35PW6cljM6uuE2UWSXCX1OA",
+    "search": "aje ondine knit midi dress - olive olive"
+  },
+  {
+    "id": "recNrWWt6rTk1hcjQ",
+    "webflow_item_id": "6a687af4f538ef8281683199",
+    "name": "Liana Bustier Top - Forest Green",
+    "slug": "liana-bustier-top-forest-green",
+    "designer": "Aje",
+    "category": "Tops",
+    "colour": "Forest Green",
+    "product_code": "",
+    "rrp": null,
+    "image": "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a687af4f538ef8281683193_od-KNZQJY7oBfBhXmebDemuD79FVHKWkU3Nyi2XvxIk.jpeg",
+    "search": "aje liana bustier top - forest green forest green"
+  },
+  {
+    "id": "recVmycSaoNsFTLKW",
+    "webflow_item_id": "6a687afbdb44d7f2d96deb96",
+    "name": "Emma Logo Bodysuit - Yellow",
+    "slug": "emma-logo-bodysuit-yellow",
+    "designer": "Aje",
+    "category": "Other",
+    "colour": "Yellow",
+    "product_code": "",
+    "rrp": null,
+    "image": "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a687afbdb44d7f2d96deb90_IUy4Em64aJVX56rHpm2Ro2SjKG-LHtPyILsslxyabV4.jpeg",
+    "search": "aje emma logo bodysuit - yellow yellow"
+  },
+  {
+    "id": "recWUlIclO1AW0tNj",
+    "webflow_item_id": "6a687afdb23dca93e482518b",
+    "name": "Framework Denim Shorts - Vintage Wash",
+    "slug": "framework-denim-shorts-vintage-wash",
+    "designer": "Aje",
+    "category": "Other",
+    "colour": "Vintage Wash",
+    "product_code": "",
+    "rrp": null,
+    "image": "https://v5.airtableusercontent.com/v3/u/55/55/1785240000000/J7vswRRMxySrseA6AF55dg/8CybwX68t9Y_a35eE3T5Wb8JVPxYrEpC708DwiajonO5YBAx9fCursPny8cwN5cbevKtNnIhSh9ePwQF2353_vAIOppZ6P_8WdXwGonCTQCrN7upRHdd_QgG9QUMppL_aH4NuOSEb8DiSvKXng9imM6TgoXJt8pesVGdYGZL50Y/EjWpo9kaKsOo_N_B_v42p8aq29vSCaEMFH59qi1JDUE",
+    "search": "aje framework denim shorts - vintage wash vintage wash"
+  },
+  {
+    "id": "recdMNXGcrHOEoFb3",
+    "webflow_item_id": "6a687b02ccfa1fbd6d502923",
+    "name": "Yolo Denim Jean",
+    "slug": "yolo-denim-jean",
+    "designer": "Alemais",
+    "category": "Bottoms",
+    "colour": "",
+    "product_code": "203P",
+    "rrp": null,
+    "image": "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a687b02ccfa1fbd6d50291d_MlvafFIkt5E3nPuPmiZ1WSNKBA7nQ57tDchXVjeK3Sg.webp",
+    "search": "alemais yolo denim jean 203p"
+  },
+  {
+    "id": "recgIm6wRtUQqH3iN",
+    "webflow_item_id": "6a687b05c5ed40b35e4dbf34",
+    "name": "Florence Wrap Dress - Blue",
+    "slug": "florence-wrap-dress-blue",
+    "designer": "Aje",
+    "category": "Dresses",
+    "colour": "Blue",
+    "product_code": "",
+    "rrp": null,
+    "image": "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a687b05c5ed40b35e4dbee4_C9vg4_bd_NgWSUdIjrhKcQStFayemaA7JkbwDwHim1w.webp",
+    "search": "aje florence wrap dress - blue blue"
+  },
+  {
+    "id": "recmjuu1KgWzNiDtZ",
+    "webflow_item_id": "6a687b086fa4896915a6ae85",
+    "name": "Dione Denim Pant - Black",
+    "slug": "dione-denim-pant-black",
+    "designer": "Aje",
+    "category": "Bottoms",
+    "colour": "Black",
+    "product_code": "22SU3183",
+    "rrp": 295,
+    "image": "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a687b086fa4896915a6ae73_Jh4aq-JmESZH8YLOHwhTq5WhplhZ7Se2LKfCBCleAfk.jpeg",
+    "search": "aje dione denim pant - black black 22su3183"
+  },
+  {
+    "id": "recnpzF5BHaRpDnME",
+    "webflow_item_id": "6a687b0ad10de6e8a05f74d5",
+    "name": "Oakleigh Maxi Skirt - Sand Brown",
+    "slug": "oakleigh-maxi-skirt-sand-brown",
+    "designer": "Aje",
+    "category": "Bottoms",
+    "colour": "Sand Brown",
+    "product_code": "24RE4176",
+    "rrp": null,
+    "image": "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a687b0ad10de6e8a05f74c0_cKdoEKlX_zjrTKK-FvbK9ZKWeKg-849H9nliFGxN2rM.webp",
+    "search": "aje oakleigh maxi skirt - sand brown sand brown 24re4176"
   }
 ]
