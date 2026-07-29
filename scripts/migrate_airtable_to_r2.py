@@ -21,6 +21,7 @@ import io
 import os
 import time
 import sys
+from urllib.parse import quote
 
 # ─────────────────────────────────────────────────────────────────────────
 # CONFIG — reads from environment variables (set locally via export, or as
@@ -55,7 +56,7 @@ LIMIT_RECORDS = int(_limit) if _limit.isdigit() else None
 # Airtable helpers
 # ─────────────────────────────────────────────────────────────────────────
 
-AIRTABLE_API_URL = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_NAME}"
+AIRTABLE_API_URL = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{quote(AIRTABLE_TABLE_NAME)}"
 AIRTABLE_HEADERS = {
     "Authorization": f"Bearer {AIRTABLE_API_KEY}",
     "Content-Type": "application/json",
