@@ -18,22 +18,25 @@ import requests
 import boto3
 from PIL import Image
 import io
+import os
 import time
 import sys
 
 # ─────────────────────────────────────────────────────────────────────────
-# CONFIG — fill these in
+# CONFIG — reads from environment variables (set locally via export, or as
+# GitHub Actions secrets). Falls back to the literal string only if you
+# prefer to hardcode for a quick local test — not recommended for git.
 # ─────────────────────────────────────────────────────────────────────────
 
-AIRTABLE_API_KEY = "YOUR_AIRTABLE_API_KEY"
-AIRTABLE_BASE_ID = "YOUR_BASE_ID"           # starts with "app..."
-AIRTABLE_TABLE_NAME = "Garments"            # your table name
+AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY", "YOUR_AIRTABLE_API_KEY")
+AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "YOUR_BASE_ID")           # starts with "app..."
+AIRTABLE_TABLE_NAME = os.getenv("AIRTABLE_TABLE_NAME", "Garments")
 
-R2_ACCOUNT_ID = "de893873641e9373ec2b5dd99540f518"
-R2_ACCESS_KEY = "YOUR_R2_ACCESS_KEY_ID"
-R2_SECRET_KEY = "YOUR_R2_SECRET_ACCESS_KEY"
-R2_BUCKET = "filted-images"
-R2_PUBLIC_URL = "https://pub-9b251a5e9a524f88a7f16e0f7838fd75.r2.dev"
+R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "de893873641e9373ec2b5dd99540f518")
+R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY", "YOUR_R2_ACCESS_KEY_ID")
+R2_SECRET_KEY = os.getenv("R2_SECRET_KEY", "YOUR_R2_SECRET_ACCESS_KEY")
+R2_BUCKET = os.getenv("R2_BUCKET", "filted-images")
+R2_PUBLIC_URL = os.getenv("R2_PUBLIC_URL", "https://pub-9b251a5e9a524f88a7f16e0f7838fd75.r2.dev")
 
 MAX_DIMENSION = 1200     # resize longest side to this many px
 JPEG_QUALITY = 80        # 0-100, 80 is a good balance
@@ -42,8 +45,11 @@ JPEG_QUALITY = 80        # 0-100, 80 is a good balance
 # text field, e.g. "Image 1" -> "Image 1 URL"
 URL_FIELD_SUFFIX = " URL"
 
-DRY_RUN = True            # ← set to False once you're ready to actually run it
-LIMIT_RECORDS = None      # e.g. set to 10 to test on a small batch first
+# DRY_RUN and LIMIT_RECORDS can be overridden via env vars too, so the
+# GitHub Actions workflow can control them without editing this file.
+DRY_RUN = os.getenv("DRY_RUN", "true").lower() != "false"
+_limit = os.getenv("LIMIT_RECORDS", "")
+LIMIT_RECORDS = int(_limit) if _limit.isdigit() else None
 
 # ─────────────────────────────────────────────────────────────────────────
 # Airtable helpers
