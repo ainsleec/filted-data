@@ -68,6 +68,8 @@ def fetch_all_records():
     params = {"pageSize": 100}
     while True:
         resp = requests.get(AIRTABLE_API_URL, headers=AIRTABLE_HEADERS, params=params)
+        if not resp.ok:
+            print(f"      Airtable error response: {resp.text}")
         resp.raise_for_status()
         data = resp.json()
         records.extend(data.get("records", []))
