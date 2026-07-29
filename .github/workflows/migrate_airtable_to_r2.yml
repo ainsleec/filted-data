@@ -33,7 +33,7 @@ jobs:
       - name: Run migration script
         env:
           AIRTABLE_API_KEY: ${{ secrets.AIRTABLE_TOKEN }}
-          AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
+          AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE }}
           AIRTABLE_TABLE_NAME: "All Garments"
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY }}
