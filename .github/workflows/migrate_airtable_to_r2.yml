@@ -42,4 +42,4 @@ jobs:
           R2_PUBLIC_URL: "https://pub-9b251a5e9a524f88a7f16e0f7838fd75.r2.dev"
           DRY_RUN: ${{ inputs.dry_run }}
           LIMIT_RECORDS: ${{ inputs.limit_records }}
-        run: python migrate_airtable_to_r2.py
+        run: python scripts/migrate_airtable_to_r2.py
