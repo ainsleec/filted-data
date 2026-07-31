@@ -61,6 +61,20 @@ recompute_garment_stats.sql, run once manually before this script's
 first run with this phase) that recalculates all four columns from
 CURRENTLY ACTIVE listings in one pass, at the end of every run.
 
+SEVENTH fix (this revision) — counterfeit/replica flagging: Ainslee
+manually spot-checks garments and identifies some eBay listings as
+selling a counterfeit/replica rather than a genuine piece. Rather than
+deleting those rows outright (which would (a) look like the listing was
+simply missed, and (b) get silently re-inserted on the next sync since
+nothing would tell this script the row was ever reviewed), a "Replica"
+checkbox field on the Resale Sightings table is now read and written
+through to Supabase's listings.is_replica column. The frontend uses this
+to fade the row and strip its outbound link rather than removing it, and
+excludes flagged rows from price-history averages. This script only ever
+READS "Replica" from Airtable and writes it to Supabase — the checkbox
+itself is set by hand in Airtable when a fake is spotted, same manual-
+verification pattern as Price Sold / Date Sold in Phase 3.
+
 Run order within main(): sync, then expiry-check, then sold-verify, then
 recompute-stats — so every run starts from as complete a picture as this
 pass can make it, checks what's still genuinely active on eBay, lets
@@ -115,6 +129,12 @@ ITEM_ID_URL_RE = re.compile(r"/itm/(\d+)")
 # Field names used specifically by Phase 3 (Sold verification) — matches
 # the exact Airtable field names from the old sold_sync.py's Sold view.
 F_PRICE_SOLD = "Price Sold"
+
+# Airtable checkbox field, set by hand when a listing is confirmed to be
+# selling a counterfeit/replica garment. Read-only from this script's
+# perspective — never written back to Airtable, only read and mirrored
+# into Supabase's listings.is_replica column. See SEVENTH fix above.
+F_REPLICA = "Replica"
 
 
 def extract_item_id(item_id_field, listing_url):
@@ -237,13 +257,15 @@ def mark_sold_listing(listing_id, sold_price, sold_at):
 
 
 def create_sold_listing(item_id, url, garment_uuid, sold_price, sold_at,
-                         listed_price, date_listed, condition, title, seller):
+                         listed_price, date_listed, condition, title, seller,
+                         is_replica=False):
     payload = {
         "ebay_item_id": item_id,
         "listing_url":  url,            # VERBATIM — keeps EPN affiliate params intact
         "garment_id":   garment_uuid,
         "end_reason":   "sold",
         "ended_reason": "sold",
+        "is_replica":   bool(is_replica),
     }
     if condition:    payload["condition"]    = condition
     if title:        payload["title"]        = title
@@ -399,6 +421,32 @@ def backfill_ebay_item_ids(items):
     return succeeded, failed
 
 
+def update_replica_flags(items):
+    """Patches is_replica on already-synced Supabase rows whose Airtable
+    Replica checkbox doesn't match what's currently stored — covers both
+    directions (a listing later confirmed as a fake, or a flag corrected
+    after being ticked in error). Runs every sync so a flag set by hand
+    in Airtable at any time reaches Supabase (and therefore the
+    frontend) on the very next run, without waiting for some other
+    change to that row to trigger a sync."""
+    succeeded, failed = 0, 0
+    for item in items:
+        resp = requests.patch(
+            f"{SUPABASE_URL}/rest/v1/listings",
+            headers=get_supabase_headers(),
+            params={"id": f"eq.{item['supabase_id']}"},
+            json={"is_replica": item["is_replica"]},
+            timeout=15,
+        )
+        if resp.ok:
+            succeeded += 1
+        else:
+            failed += 1
+            print(f"   ⚠️  Replica flag update FAILED for {item['supabase_id']}: {resp.status_code} {resp.text[:150]}")
+        time.sleep(0.05)
+    return succeeded, failed
+
+
 def insert_listings(rows):
     """Bulk insert in batches of 50. On batch failure, retry rows individually
     so one bad row doesn't sink the other 49 good ones."""
@@ -441,7 +489,7 @@ def run_sync_phase():
     print("📊 Loading existing Supabase listings (for dedup + reconciliation)...")
     existing_listings = load_all_supabase_rows(
         "listings",
-        "id,ebay_item_id,airtable_id,ended_at,listed_price,started_at,price_history"
+        "id,ebay_item_id,airtable_id,ended_at,listed_price,started_at,price_history,is_replica"
     )
     existing_ids = {str(r["ebay_item_id"]) for r in existing_listings if r.get("ebay_item_id")}
     existing_airtable_ids = {r["airtable_id"] for r in existing_listings if r.get("airtable_id")}
@@ -458,7 +506,7 @@ def run_sync_phase():
     sightings = load_all_airtable_sightings(fields=[
         "eBay Item ID", "Listing URL", "eBay Title", "Seller Name",
         "Condition", "Listed Price", "Date Listed", "Status", "Date Sold",
-        "Garment",
+        "Garment", F_REPLICA,
     ])
     print(f"   {len(sightings)} total sightings")
 
@@ -468,6 +516,7 @@ def run_sync_phase():
     to_reconcile = []
     to_backfill_id_only = []
     to_reactivate = []  # TRUE relists — same Airtable record, new eBay Item ID
+    to_update_replica = []  # is_replica changed on an already-synced row
 
     run_now_iso = datetime.now(timezone.utc).isoformat()
 
@@ -476,14 +525,17 @@ def run_sync_phase():
         listing_url = f.get("Listing URL", "") or ""
         item_id = extract_item_id(f.get("eBay Item ID"), listing_url)
         status = f.get("Status")
+        is_replica = bool(f.get(F_REPLICA))
 
         if not item_id:
             no_item_id += 1
             continue
         if item_id in existing_ids:
             already_synced += 1
+            existing_row = by_ebay_id.get(item_id)
+            if existing_row and bool(existing_row.get("is_replica")) != is_replica:
+                to_update_replica.append({"supabase_id": existing_row["id"], "is_replica": is_replica})
             if status in ("Sold", "Expired"):
-                existing_row = by_ebay_id.get(item_id)
                 if existing_row and existing_row.get("ended_at") is None:
                     to_reconcile.append({
                         "supabase_id": existing_row["id"],
@@ -495,6 +547,8 @@ def run_sync_phase():
         if rec["id"] in existing_airtable_ids:
             already_by_at_id += 1
             existing_row = by_airtable_id.get(rec["id"])
+            if existing_row and bool(existing_row.get("is_replica")) != is_replica:
+                to_update_replica.append({"supabase_id": existing_row["id"], "is_replica": is_replica})
             if status in ("Sold", "Expired"):
                 if existing_row and existing_row.get("ended_at") is None:
                     needs_backfill = not existing_row.get("ebay_item_id")
@@ -558,6 +612,7 @@ def run_sync_phase():
             "ended_at":     None,
             "end_reason":   None,
             "ended_reason": None,
+            "is_replica":   is_replica,
         }
 
         if status == "Sold":
@@ -585,6 +640,7 @@ def run_sync_phase():
     print(f"   Existing rows needing reconciliation (Airtable already resolved, Supabase still open): {len(to_reconcile)}")
     print(f"   Existing rows relisted under a new eBay Item ID: {len(to_reactivate)}")
     print(f"   Existing Active rows needing ebay_item_id backfill only: {len(to_backfill_id_only)}")
+    print(f"   Existing rows with a changed Replica flag: {len(to_update_replica)}")
     print(f"   🔧 New listings to insert: {len(to_insert)}")
 
     if to_insert:
@@ -592,7 +648,8 @@ def run_sync_phase():
             print(f"\n🧪 DRY RUN — would insert {len(to_insert)} new listings. No writes made.")
             for row in to_insert[:5]:
                 print(f"   • {row['ebay_item_id']} | {row['title'][:50]!r} | "
-                      f"garment_id={row['garment_id']} | end_reason={row['end_reason']}")
+                      f"garment_id={row['garment_id']} | end_reason={row['end_reason']} | "
+                      f"is_replica={row['is_replica']}")
         else:
             print(f"\n📝 Inserting {len(to_insert)} new listings into Supabase...")
             inserted, errors = insert_listings(to_insert)
@@ -636,6 +693,18 @@ def run_sync_phase():
             print(f"   {react_succeeded} reactivated | {react_failed} FAILED")
     else:
         print("\n   No relisted rows needing reactivation.")
+
+    if to_update_replica:
+        if DRY_RUN:
+            print(f"\n🧪 DRY RUN — would update is_replica on {len(to_update_replica)} existing rows. No writes made.")
+            for r in to_update_replica[:10]:
+                print(f"   • supabase_id={r['supabase_id']} -> is_replica={r['is_replica']}")
+        else:
+            print(f"\n📝 Updating is_replica on {len(to_update_replica)} existing rows...")
+            rep_succeeded, rep_failed = update_replica_flags(to_update_replica)
+            print(f"   {rep_succeeded} succeeded | {rep_failed} FAILED")
+    else:
+        print("\n   No Replica flag changes to apply.")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -870,6 +939,7 @@ def load_sold_sightings():
         fields=[
             "eBay Item ID", "Listing URL", "Status", F_PRICE_SOLD, "Date Sold",
             "Condition", "Garment", "Listed Price", "Date Listed", "eBay Title", "Seller Name",
+            F_REPLICA,
         ],
         filter_formula='{Status}="Sold"',
     )
@@ -944,12 +1014,14 @@ def run_sold_sync_phase():
         sold_at = parse_date(f.get("Date Sold"))
         listed  = parse_price(f.get("Listed Price"))
         dlisted = parse_date(f.get("Date Listed"))
+        is_replica = bool(f.get(F_REPLICA))
         if price is None:
             created_no_price += 1
 
         if create_sold_listing(
             item_id, f.get("Listing URL"), garment_uuid, price, sold_at,
             listed, dlisted, f.get("Condition"), f.get("eBay Title"), f.get("Seller Name"),
+            is_replica=is_replica,
         ):
             created += 1
             created_ids.add(item_id)
@@ -993,6 +1065,12 @@ def run_sold_sync_phase():
 # run that once manually before this script's first run with this phase)
 # so the aggregation itself happens inside the database rather than
 # pulling every listings row into Python to compute a median.
+#
+# NOTE: recompute_garment_stats.sql should be reviewed to confirm it
+# excludes is_replica=true rows from listed_price_median/min/max —
+# otherwise a flagged counterfeit's price still quietly skews the
+# aggregate figures shown on campaign embeds even though the garment
+# page itself now excludes it from its own price-history display.
 # ══════════════════════════════════════════════════════════════════════════
 
 def run_recompute_stats_phase():
