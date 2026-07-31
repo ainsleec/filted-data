@@ -1,0 +1,51 @@
+name: Backfill webflow_item_id (one-off)
+
+# Manual trigger only — this is a one-time cleanup script, not a
+# recurring sync, so it has no schedule: block. Run it from the
+# Actions tab: Actions -> "Backfill webflow_item_id (one-off)" ->
+# Run workflow.
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run only (no writes)? Leave true first, confirm the output, then re-run with false."
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        # garments.json must already be committed in this repo (it's
+        # written by webflow_sync.py's export_garments_json() on every
+        # normal sync run) — this step just needs a checkout, no
+        # separate download step, as long as it's tracked in git.
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Confirm garments.json is present
+        run: |
+          if [ ! -f garments.json ]; then
+            echo "::error::garments.json not found in repo root — check the path in backfill_webflow_item_id.py matches where webflow_sync.py actually commits it."
+            exit 1
+          fi
+          echo "Found garments.json ($(wc -l < garments.json) lines)"
+
+      - name: Run backfill
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: python backfill_webflow_item_id.py
