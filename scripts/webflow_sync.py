@@ -205,6 +205,47 @@ placeholder to verify, not a confirmed value.
       being created — and the recovered ID is written straight back to
       Airtable. This closes the gap even for some other future failure
       mode that leaves Airtable's ID blank while a live item exists.
+
+--------------------------------------------------------------------------
+2026-08 REVISION NOTES (webflow_item_id never reached Supabase):
+
+7. Supabase's garments.webflow_item_id was null for the vast majority of
+   garments (confirmed 6,819 of ~7,000 via a direct count) — same shape
+   of bug as revision note 5's image_url gap, just on a different column,
+   and undiscovered until now because it doesn't break anything visibly —
+   it silently hides garments from search instead of showing a broken
+   icon. search_garments() filters to `webflow_item_id is not null`, so
+   any garment whose Supabase row was created with this column blank has
+   been permanently invisible in site search ever since, regardless of
+   being live, published, and fully correct on Webflow itself — surfaced
+   2026-08 investigating garments findable in Webflow CMS but absent from
+   filted.com.au's own search results (e.g. "Belonging Mini Dress",
+   "Belonging Short", "Belonging Flared Midi Dress" — all published,
+   none searchable).
+
+   Root cause: this script writes slug (update_supabase_garment_slug)
+   and image_url (update_supabase_garment_image) back to Supabase on
+   every sync, alongside the Webflow write — but there was never an
+   equivalent write for webflow_item_id itself. Whatever process
+   originally created these Supabase rows (see module docstring: this
+   script only ever looks up an existing row by airtable_id, it never
+   creates one) evidently left webflow_item_id blank at creation time,
+   and nothing since has ever gone back to fill it in.
+
+   Fixed by adding update_supabase_garment_webflow_id(), called
+   alongside the slug/image write-backs on every garment sync (both
+   the create and update paths, since existing_wf_id can itself have
+   been blank/stale for a garment being updated in place).
+
+   Same as the image_url fix's shape: this is incremental-sync-safe
+   going forward (only touched garments get corrected), but the ~6,819
+   ALREADY-affected rows need a one-time backfill, since normal
+   incremental runs won't touch untouched historical rows. See the
+   separate backfill_webflow_item_id.py script — it reads the correct
+   airtable_id -> webflow_item_id mapping straight out of the committed
+   garments.json (which HAS always had this value correct, since
+   export_garments_json() below was never missing it) rather than
+   re-querying Airtable/Webflow for ~7,000 records again.
 --------------------------------------------------------------------------
 """
 
@@ -543,6 +584,31 @@ def update_supabase_garment_image(supabase_uuid, image_url):
     res = requests.patch(url, headers=SUPABASE_HEADERS, json={"image_url": image_url}, timeout=15)
     if not res.ok:
         print(f"  WARNING: failed to update Supabase image_url for {supabase_uuid}: {res.status_code} {res.text[:200]}")
+
+
+def update_supabase_garment_webflow_id(supabase_uuid, webflow_item_id):
+    """Keeps Supabase's garments.webflow_item_id in sync on every run —
+    same best-effort pattern as update_supabase_garment_slug/image
+    (log-and-continue on failure, never fail the garment).
+
+    2026-08 FIX: this call didn't exist before. search_garments() filters
+    to `webflow_item_id is not null`, so any garment whose Supabase row
+    was created with this column blank was permanently invisible in site
+    search even while fully live and published on Webflow — confirmed
+    6,819 of ~7,000 garments affected. See revision note 7 at the top of
+    this file. This closes the gap going forward; the ~6,819 already-
+    affected rows need a separate one-time backfill (see
+    backfill_webflow_item_id.py, which sources the correct value from
+    garments.json rather than re-querying Airtable/Webflow)."""
+    if not webflow_item_id:
+        return
+    if DRY_RUN:
+        print(f"  [DRY RUN] would update Supabase garments.webflow_item_id for {supabase_uuid} -> {webflow_item_id}")
+        return
+    url = f"{SUPABASE_URL}/rest/v1/garments?id=eq.{supabase_uuid}"
+    res = requests.patch(url, headers=SUPABASE_HEADERS, json={"webflow_item_id": webflow_item_id}, timeout=15)
+    if not res.ok:
+        print(f"  WARNING: failed to update Supabase webflow_item_id for {supabase_uuid}: {res.status_code} {res.text[:200]}")
 
 
 # ── Cloudflare KV helper (redirects) ─────────────────────────────────────
@@ -1137,6 +1203,16 @@ def sync_garments(qualifying_garments, campaign_webflow_ids, designer_webflow_id
 
             if supabase_uuid:
                 update_supabase_garment_image(supabase_uuid, image_url)
+                # 2026-08 FIX (revision note 7): the one write-back that
+                # was missing entirely — see update_supabase_garment_
+                # webflow_id()'s own docstring for why this mattered.
+                # Applies on BOTH the create and update paths: wf_item_id
+                # is set either way by this point (freshly created above,
+                # adopted via the collision-recovery fallback, or the
+                # pre-existing existing_wf_id for a normal update), and
+                # any of those could still be missing from Supabase even
+                # if Airtable itself already had the correct ID.
+                update_supabase_garment_webflow_id(supabase_uuid, wf_item_id)
 
             # Register this slug immediately so a later garment in the same
             # run — including any that previously collided with THIS one
