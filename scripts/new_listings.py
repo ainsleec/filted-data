@@ -314,6 +314,18 @@ def extract_colour(title):
     return None  # kept simple deliberately — colour tie-break is a nice-to-have,
                  # not required for the core matching to function correctly
 
+def extract_size(title):
+    """Pull size straight from the eBay title before clean_title() strips it.
+    Prefers numeric AU sizes (Size 8, Sz 10) since that's what your garments
+    use; falls back to letter sizing (XS/S/M/L/XL/XXL) if no number is found."""
+    m = re.search(r'\b(?:size|sz)\s*(\d{1,2})\b', title, flags=re.IGNORECASE)
+    if m:
+        return m.group(1)
+    m = re.search(r'\b(xs|s|m|l|xl|xxl)\b', title, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+    return None
+
 
 def find_best_match(ebay_title, garments, designer_name=None, ebay_colour=None):
     cleaned = clean_title(ebay_title, designer_name)
@@ -458,8 +470,8 @@ def parse_item(raw, designer_name):
         "designer":         designer_name,
         "condition":        condition,
         "location_country": location_country,
+        "size":             extract_size(title),   # ← new
     }
-
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
@@ -595,6 +607,8 @@ def main():
                     fields["eBay Image"] = [{"url": item["image_url"]}]
                 if item.get("condition"):
                     fields["Condition"] = item["condition"]
+                if item.get("size"):                 # ← new
+                    fields["Size"] = item["size"]    # ← new
 
                 if match and score >= AUTO_MATCH_THRESHOLD:
                     fields["Garment"] = [match["id"]]
