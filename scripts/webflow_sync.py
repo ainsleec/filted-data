@@ -194,7 +194,9 @@ placeholder to verify, not a confirmed value.
    through to the numeric-suffix fallback and created a SECOND Webflow
    item: same visible Name, different slug.
 
-   Fixed two ways:
+   Fixed two ways (INCOMPLETE — see revision note 8 below, this fix had
+   an ordering bug that meant it didn't actually catch the case it was
+   built for):
    a. airtable_request()/airtable_update() now retry on 429/5xx with the
       same backoff pattern webflow_request() already uses, so a
       transient rate-limit hit no longer silently drops the write-back.
@@ -246,6 +248,68 @@ placeholder to verify, not a confirmed value.
    garments.json (which HAS always had this value correct, since
    export_garments_json() below was never missing it) rather than
    re-querying Airtable/Webflow for ~7,000 records again.
+
+--------------------------------------------------------------------------
+2026-08 REVISION NOTES (recovery fallback ran too late — new duplicates
+still being created for garments with a blank Webflow Item ID):
+
+8. Root cause: several garments turned up live on Webflow but still
+   completely absent from Airtable's "Webflow Item ID" column — i.e.
+   exactly the scenario revision note 6's "defensive fallback" was
+   supposed to catch and recover from. It didn't, because of an
+   ordering bug in that fix.
+
+   The old code computed new_slug via build_slug() FIRST, using
+   self_wf_id=existing_wf_id (which is None for a garment whose write-
+   back previously failed) — and only checked for an adoptable existing
+   item AFTER, using that already-computed new_slug:
+
+       new_slug = build_slug(..., self_wf_id=existing_wf_id)   # existing_wf_id is None
+       existing_item = webflow_get_item(...) if existing_wf_id else None
+       if not existing_item and new_slug in existing_slugs:      # never true — see below
+           ...adopt...
+
+   Inside build_slug(), the taken() check is:
+
+       owner = existing_slugs.get(candidate)
+       return owner is not None and owner != self_wf_id
+
+   With self_wf_id=None, the garment's OWN live item (sitting in
+   existing_slugs under its base slug, owned by its real Webflow item
+   ID) reads as "taken by someone else" — because the real owner ID is
+   never equal to None. So build_slug() walked straight past the base
+   slug into its fallback chain (base+product-code, then base+numeric
+   suffix) and returned a slug that was NEVER live on Webflow. The
+   recovery check right after then looked for THAT fallback slug in
+   existing_slugs — which of course wasn't there, since it was newly
+   invented — so `not existing_item and new_slug in existing_slugs`
+   was always False for exactly the garments this fallback existed to
+   catch. The script fell through to webflow_create_item(), creating a
+   duplicate item under the fallback slug. If the write-back for THAT
+   create also failed, the result is indistinguishable from the
+   original bug: live on Webflow, blank in Airtable — just with an
+   extra orphaned duplicate item now sitting in the collection too.
+
+   Fixed by reordering: compute the garment's plain base slug (no
+   fallback chain) FIRST and check it against existing_slugs BEFORE
+   calling build_slug() at all. If the base slug is live and this
+   garment has no existing_wf_id, adopt that live item's ID as
+   existing_wf_id right away — THEN call build_slug() with the now-
+   correct self_wf_id, so taken() recognizes the slug as belonging to
+   "itself" and returns the base slug unchanged rather than inventing a
+   new one. This makes the create-vs-update branch later in the loop
+   correctly take the update path instead of create.
+
+   Also added: a startup reconciliation pass (reconcile_orphaned_items())
+   that scans every live Webflow item's Airtable Record ID field
+   (WF_FIELD_AIRTABLE_ID) against Airtable's own Webflow Item ID column,
+   and backfills Airtable directly for any garment where a live Webflow
+   item already references it but Airtable's own column is still blank
+   — independent of slug matching, so it also catches any already-
+   orphaned duplicates left over from the bug above before this run's
+   sync logic even starts. This runs once per invocation, using the same
+   existing_items list already fetched for slug-collision loading (no
+   extra Webflow calls).
 --------------------------------------------------------------------------
 """
 
@@ -410,7 +474,7 @@ def airtable_request(method, url, json_body=None, params=None, max_retries=5):
     drop the Webflow-Item-ID write-back after a successful create,
     leaving Airtable's field blank even though a live Webflow item
     existed — which caused the next run to create a second item for the
-    same garment (see revision note 6 at the top of this file)."""
+    same garment (see revision notes 6 and 8 at the top of this file)."""
     for attempt in range(max_retries):
         res = requests.request(method, url, headers=AIRTABLE_HEADERS,
                                json=json_body, params=params, timeout=30)
@@ -468,9 +532,9 @@ def airtable_fetch_all(table, filter_formula=None, fields=None):
 
 def airtable_update(table, record_id, fields):
     """Writes back to Airtable (e.g. a new Webflow Item ID after create).
-    Now routed through airtable_request() for 429/5xx retry — see
-    revision note 6. This call used to be a bare requests.patch() with no
-    retry handling at all, which was the actual root cause of the garment
+    Routed through airtable_request() for 429/5xx retry — see revision
+    note 6. This call used to be a bare requests.patch() with no retry
+    handling at all, which was the actual root cause of the garment
     duplication bug: a dropped write-back here left Airtable's Webflow
     Item ID blank even though the Webflow item had been created
     successfully, so the next run treated the garment as never-created."""
@@ -670,6 +734,21 @@ def slugify(text):
     return text[:80]
 
 
+def base_slug_for_garment(name_formula, fallback_name):
+    """Plain, un-disambiguated slugify of the garment's name — no
+    fallback chain, no uniqueness enforcement. Used ONLY for the
+    pre-check against existing_slugs in sync_garments() (revision note
+    8) so a garment can be matched against its own already-live item
+    BEFORE build_slug()'s fallback logic runs and potentially invents a
+    slug that was never actually live. build_slug() remains the single
+    source of truth for the slug that's actually written to Webflow."""
+    base = name_formula or fallback_name or ""
+    slug = slugify(base)
+    if not slug:
+        slug = slugify(fallback_name or "garment")
+    return slug
+
+
 def build_slug(record_id, name_formula, fallback_name, product_code, existing_slugs, self_wf_id=None):
     """Single source of truth: slugify the Name (Formula) field.
 
@@ -678,14 +757,18 @@ def build_slug(record_id, name_formula, fallback_name, product_code, existing_sl
     appended when present, bare name when not — e.g. for Alemais, which
     has no Product Colour data at all).
 
-    Uniqueness is now enforced in code, not by manual pre-run checking:
+    Uniqueness is enforced in code, not by manual pre-run checking:
     existing_slugs is a dict of {slug: webflow_item_id} for every item
     currently live in the Garments collection (loaded once at the start
     of sync_garments(), and kept updated as this run creates/updates
     items, so collisions between two brand-new items in the same run are
-    also caught). self_wf_id is this garment's own existing Webflow item
-    ID, if any — so a garment being re-synced with the same slug it
-    already has isn't flagged as colliding with itself.
+    also caught). self_wf_id is this garment's own existing (or newly
+    adopted — see revision note 8) Webflow item ID, if any — so a
+    garment being re-synced with the same slug it already has isn't
+    flagged as colliding with itself. CALLERS MUST resolve self_wf_id
+    (including adopting a matching live item by base slug, if
+    applicable) BEFORE calling this — see base_slug_for_garment() and
+    the adoption step in sync_garments().
 
     Fallback chain if the base slug is taken by a *different* item:
       1. base slug + slugified Product Code (if Product Code is set)
@@ -695,10 +778,7 @@ def build_slug(record_id, name_formula, fallback_name, product_code, existing_sl
     If Name (Formula) is somehow blank, falls back to the raw Garment
     Name plus a short id suffix so slugs never collide outright.
     """
-    base = name_formula or fallback_name or ""
-    slug = slugify(base)
-    if not slug:
-        slug = slugify(fallback_name or "garment")
+    slug = base_slug_for_garment(name_formula, fallback_name)
     if len(slug) < 3:
         slug = f"{slug}-{record_id[-8:].lower()}"
 
@@ -1076,6 +1156,63 @@ def sync_campaigns(qualifying_garments):
     return campaign_webflow_ids
 
 
+# ── Step 4.5: reconcile already-orphaned items (blank Airtable ID but ──────
+#              a live Webflow item already references this record) ────────
+def reconcile_orphaned_items(existing_items):
+    """Scans every live Webflow Garments item's Airtable Record ID field
+    (WF_FIELD_AIRTABLE_ID) and, for any whose Airtable record still has a
+    blank Webflow Item ID, backfills Airtable directly.
+
+    Added 2026-08 (revision note 8) as a startup safety net: this catches
+    garments already left orphaned by the ordering bug in a *previous*
+    run, independent of slug matching, before this run's own sync loop
+    even starts. Uses the existing_items list already fetched by
+    sync_garments() for slug-collision loading — no extra Webflow calls.
+
+    If a garment's live item has more than one candidate (shouldn't
+    happen given build_slug()'s uniqueness guarantee, but Webflow doesn't
+    enforce uniqueness on WF_FIELD_AIRTABLE_ID itself), the first one
+    encountered wins and a warning is printed — that scenario points at a
+    genuine duplicate needing manual review, not something this pass
+    should silently resolve on its own."""
+    print("Reconciling orphaned Webflow items against Airtable...")
+
+    webflow_by_airtable_id = {}
+    for item in existing_items:
+        fd = item.get("fieldData", {})
+        art_id = fd.get(WF_FIELD_AIRTABLE_ID)
+        if not art_id:
+            continue
+        if art_id in webflow_by_airtable_id and webflow_by_airtable_id[art_id] != item["id"]:
+            print(f"  WARNING: multiple live Webflow items reference Airtable record {art_id} "
+                  f"({webflow_by_airtable_id[art_id]} and {item['id']}) — needs manual review, skipping.")
+            continue
+        webflow_by_airtable_id[art_id] = item["id"]
+
+    if not webflow_by_airtable_id:
+        print("  No Airtable-record-ID-tagged items found — nothing to reconcile.")
+        return
+
+    airtable_rows = airtable_fetch_all(
+        GARMENTS_TABLE,
+        filter_formula=f"{{{FLD_WEBFLOW_ITEM_ID}}}=''",
+        fields=[FLD_GARMENT_NAME, FLD_WEBFLOW_ITEM_ID],
+    )
+
+    reconciled = 0
+    for r in airtable_rows:
+        wf_id = webflow_by_airtable_id.get(r["id"])
+        if not wf_id:
+            continue
+        name = r["fields"].get(FLD_GARMENT_NAME, "(unnamed)")
+        print(f"  RECONCILED: {r['id']} ({name}) — Airtable was blank, "
+              f"live Webflow item {wf_id} already references it. Backfilling.")
+        airtable_update(GARMENTS_TABLE, r["id"], {FLD_WEBFLOW_ITEM_ID: wf_id})
+        reconciled += 1
+
+    print(f"Reconciliation complete: {reconciled} Airtable record(s) backfilled.")
+
+
 # ── Step 5: sync Garments ─────────────────────────────────────────────────
 def sync_garments(qualifying_garments, campaign_webflow_ids, designer_webflow_ids):
     if not qualifying_garments:
@@ -1094,6 +1231,11 @@ def sync_garments(qualifying_garments, campaign_webflow_ids, designer_webflow_id
             existing_slugs[s] = item["id"]
     print(f"  {len(existing_slugs)} existing slugs loaded from {len(existing_items)} live items")
 
+    # Revision note 8: catch any garments already left orphaned by a
+    # previous run's write-back failure, independent of this run's slug
+    # logic, before processing begins.
+    reconcile_orphaned_items(existing_items)
+
     synced = []
     failures = []
 
@@ -1106,34 +1248,53 @@ def sync_garments(qualifying_garments, campaign_webflow_ids, designer_webflow_id
 
         try:
             existing_wf_id = f.get(FLD_WEBFLOW_ITEM_ID)
+            existing_item = None
+
+            # REVISION NOTE 8 — adopt BEFORE computing the real slug, not
+            # after. If Airtable's Webflow Item ID is blank (e.g. a prior
+            # write-back failed), check whether this garment's plain,
+            # un-disambiguated base slug is already live on Webflow. If
+            # so, that live item almost certainly IS this garment —
+            # adopt its ID as existing_wf_id right now, so build_slug()
+            # below receives the correct self_wf_id and returns the
+              # slug already in use (rather than inventing a new one that
+            # was never live, which is what silently let duplicates
+            # through before this fix).
+            if not existing_wf_id:
+                candidate_base = base_slug_for_garment(name_formula, garment_name)
+                adopted_wf_id = existing_slugs.get(candidate_base)
+                if adopted_wf_id:
+                    fetched = webflow_get_item(GARMENTS_COLLECTION_ID, adopted_wf_id)
+                    if fetched:
+                        existing_wf_id = adopted_wf_id
+                        existing_item = fetched
+                        print(f"  RECOVERED: garment {airtable_id} ({display_name}) had blank "
+                              f"Webflow Item ID but slug '{candidate_base}' already exists as "
+                              f"{adopted_wf_id} — adopting instead of creating a duplicate.")
+                        airtable_update(GARMENTS_TABLE, airtable_id, {FLD_WEBFLOW_ITEM_ID: adopted_wf_id})
 
             new_slug = build_slug(
                 airtable_id, name_formula, garment_name, f.get(FLD_PRODUCT_CODE, ""),
                 existing_slugs, self_wf_id=existing_wf_id,
             )
 
-            existing_item = webflow_get_item(GARMENTS_COLLECTION_ID, existing_wf_id) if existing_wf_id else None
+            # Normal path: existing_wf_id came from Airtable directly
+            # (not adopted above) — fetch it if we haven't already.
+            if existing_wf_id and existing_item is None:
+                existing_item = webflow_get_item(GARMENTS_COLLECTION_ID, existing_wf_id)
 
-            # DEFENSIVE FALLBACK (2026-07, revision note 6): Airtable's
-            # Webflow Item ID can be blank even when a live Webflow item
-            # already exists for this exact slug — this happens if a
-            # prior run created the item but the write-back PATCH to
-            # Airtable failed (rate limit, network blip, etc.) before
-            # airtable_update() had retry protection. Rather than blindly
-            # creating a second item, check the live-slugs map we already
-            # loaded above for collision detection: if new_slug is
-            # already owned by a real Webflow item, adopt that item as
-            # "existing" instead of creating a duplicate.
+            # Belt-and-braces: even after the adoption step above, still
+            # check the FINAL computed slug against existing_slugs in
+            # case some other path led here with no existing_item found
+            # yet. Cheap and harmless if it never fires.
             if not existing_item and new_slug in existing_slugs:
                 adopted_wf_id = existing_slugs[new_slug]
-                existing_item = webflow_get_item(GARMENTS_COLLECTION_ID, adopted_wf_id)
-                if existing_item:
+                fetched = webflow_get_item(GARMENTS_COLLECTION_ID, adopted_wf_id)
+                if fetched:
                     existing_wf_id = adopted_wf_id
-                    print(f"  RECOVERED: garment {airtable_id} had blank Webflow Item ID but "
-                          f"slug '{new_slug}' already exists as {adopted_wf_id} — adopting "
-                          f"instead of creating a duplicate.")
-                    # Write the recovered ID back to Airtable right away
-                    # so this recovery only has to happen once per garment.
+                    existing_item = fetched
+                    print(f"  RECOVERED (secondary check): garment {airtable_id} ({display_name}) — "
+                          f"slug '{new_slug}' already exists as {adopted_wf_id} — adopting.")
                     airtable_update(GARMENTS_TABLE, airtable_id, {FLD_WEBFLOW_ITEM_ID: adopted_wf_id})
 
             supabase_uuid = get_supabase_garment_uuid(airtable_id)  # may be None — see module docstring
