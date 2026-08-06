@@ -1,13 +1,17 @@
 """
 backfill_product_code.py
 
-Fixes the ~332 Aje garments (and any others) where Airtable has a
-non-empty Product Code but Supabase's `garments.product_code` is empty.
+Fixes Supabase garments where `product_code` is empty but Airtable has
+a non-empty Product Code for the same garment.
 
-This is a targeted backfill, NOT a full re-sync — it only touches rows
-where Supabase is missing data that already exists in Airtable, and
-regenerates `search_vector` for any row it updates so search picks the
-code up immediately.
+Originally this matched records by Airtable's internal record ID
+(`airtable_id`), but those values in Supabase are stale (likely from
+before a table rebuild), causing 100% 404s. Instead this matches by
+`webflow_item_id`, which is confirmed reliably synced on both sides
+and doesn't drift the way internal Airtable record IDs do.
+
+This also fetches the whole Airtable table once instead of doing one
+API call per record — faster and avoids per-record errors entirely.
 
 Usage:
     python backfill_product_code.py            # dry run, prints what would change
@@ -22,7 +26,6 @@ Env vars required (matches repo secrets):
 """
 
 import os
-import sys
 import argparse
 from pyairtable import Table
 from supabase import create_client
@@ -36,23 +39,22 @@ AIRTABLE_TABLE_NAME = os.environ.get("AIRTABLE_TABLE_NAME", "All Garments")
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 
-# Airtable field names — confirm these match your base exactly.
-# From the screenshots: "Product Code" is the field label shown in the
-# filter UI. Adjust if the underlying field name differs.
+# Confirmed exact Airtable field names
+AIRTABLE_WEBFLOW_ID_FIELD = "Webflow Item ID"
 AIRTABLE_PRODUCT_CODE_FIELD = "Product Code"
 
-BATCH_SIZE = 200
+BATCH_SIZE = 500
 
 
 def get_supabase_rows_missing_code(supabase):
     """Fetch all garments in Supabase where product_code is empty/null,
-    paginated, along with their airtable_id so we can look them up."""
+    paginated, along with their webflow_item_id."""
     rows = []
     start = 0
     while True:
         resp = (
             supabase.table("garments")
-            .select("id, airtable_id, product_code, designer_name")
+            .select("id, webflow_item_id, product_code, designer_name")
             .or_("product_code.is.null,product_code.eq.")
             .range(start, start + BATCH_SIZE - 1)
             .execute()
@@ -65,22 +67,17 @@ def get_supabase_rows_missing_code(supabase):
     return rows
 
 
-def get_airtable_codes_by_id(airtable_ids):
-    """Fetch current Product Code values from Airtable for the given
-    record IDs. Airtable doesn't support IN-style filters well over
-    large ID lists via formula, so we fetch in chunks by record id."""
+def get_airtable_codes_by_webflow_id():
+    """Fetch the entire Airtable table once and build a lookup of
+    webflow_item_id -> product_code for every record with a non-empty code."""
     table = Table(AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_TABLE_NAME)
     codes = {}
-    for rec_id in airtable_ids:
-        try:
-            record = table.get(rec_id)
-        except Exception as e:
-            print(f"  ! failed to fetch Airtable record {rec_id}: {e}")
-            continue
-        code = (record.get("fields", {}) or {}).get(AIRTABLE_PRODUCT_CODE_FIELD, "")
-        code = (code or "").strip()
-        if code:
-            codes[rec_id] = code
+    for record in table.all(fields=[AIRTABLE_WEBFLOW_ID_FIELD, AIRTABLE_PRODUCT_CODE_FIELD]):
+        fields = record.get("fields", {}) or {}
+        webflow_id = (fields.get(AIRTABLE_WEBFLOW_ID_FIELD) or "").strip()
+        code = (fields.get(AIRTABLE_PRODUCT_CODE_FIELD) or "").strip()
+        if webflow_id and code:
+            codes[webflow_id] = code
     return codes
 
 
@@ -96,24 +93,26 @@ def main():
     missing_rows = get_supabase_rows_missing_code(supabase)
     print(f"  found {len(missing_rows)} rows in Supabase with empty product_code")
 
-    airtable_ids = [r["airtable_id"] for r in missing_rows if r.get("airtable_id")]
-    if not airtable_ids:
-        print("No airtable_id values to look up. Exiting.")
-        return
+    print("Fetching all Airtable records (single bulk fetch)...")
+    airtable_codes = get_airtable_codes_by_webflow_id()
+    print(f"  Airtable has {len(airtable_codes)} records with a non-empty Webflow Item ID + Product Code")
 
-    print(f"Looking up {len(airtable_ids)} records in Airtable...")
-    airtable_codes = get_airtable_codes_by_id(airtable_ids)
-    print(f"  Airtable has a non-empty code for {len(airtable_codes)} of these")
+    to_update = []
+    skipped_no_webflow_id = 0
+    for r in missing_rows:
+        wid = (r.get("webflow_item_id") or "").strip()
+        if not wid:
+            skipped_no_webflow_id += 1
+            continue
+        if wid in airtable_codes:
+            to_update.append((r, airtable_codes[wid]))
 
-    to_update = [
-        r for r in missing_rows
-        if r.get("airtable_id") in airtable_codes
-    ]
-
-    print(f"\n{len(to_update)} rows can be backfilled (Airtable has a code, Supabase doesn't):\n")
+    print(f"\n{len(to_update)} rows can be backfilled (matched by Webflow Item ID, Airtable has a code):")
+    if skipped_no_webflow_id:
+        print(f"  ({skipped_no_webflow_id} Supabase rows skipped — no webflow_item_id to match on)")
 
     by_designer = {}
-    for r in to_update:
+    for r, _ in to_update:
         by_designer[r["designer_name"]] = by_designer.get(r["designer_name"], 0) + 1
     for designer, count in sorted(by_designer.items(), key=lambda x: -x[1]):
         print(f"  {designer}: {count}")
@@ -124,15 +123,14 @@ def main():
 
     print("\nApplying updates...")
     updated = 0
-    for r in to_update:
-        code = airtable_codes[r["airtable_id"]]
+    for r, code in to_update:
         try:
             supabase.table("garments").update({
                 "product_code": code,
             }).eq("id", r["id"]).execute()
             updated += 1
         except Exception as e:
-            print(f"  ! failed to update {r['id']} ({r['airtable_id']}): {e}")
+            print(f"  ! failed to update {r['id']} (webflow_item_id={r['webflow_item_id']}): {e}")
 
     print(f"\nUpdated {updated} rows.")
     print(
