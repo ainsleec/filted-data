@@ -86315,7 +86315,7 @@
     "category": "Tops",
     "colour": "Olive Leaf",
     "product_code": "",
-    "rrp": 0,
+    "rrp": 245,
     "image": "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a502d70da9aa15e9f7f0640_T27HdG9G3MF6QhPn2d9kylnlyH06Q3l2pVoZ8lw5n1w.jpeg",
     "search": "aje oasis shell top - olive leaf olive leaf"
   },
@@ -95249,5 +95249,31 @@
     "rrp": 155,
     "image": "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a74875c681cadad425fefc1_V6GVnZG0Q2mnit7t1jbjfsrofASlXFkCjAooScwk9bw.jpeg",
     "search": "aje elements tie back tee - pink pink"
+  },
+  {
+    "id": "rec1Y1ZsRixxdwgNd",
+    "webflow_item_id": "6a76633dfe257d35d656f374",
+    "name": "Nova Tie Back Midi Dress - Deep Olive",
+    "slug": "nova-tie-back-midi-dress-deep-olive",
+    "designer": "Aje",
+    "category": "Dresses",
+    "colour": "Deep Olive",
+    "product_code": "",
+    "rrp": 495,
+    "image": "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a76633cfe257d35d656f31e_rx4E0JcTQ4YtuS2dNHswLohWU6IkRNK4Y1lm_6tZJgs.jpeg",
+    "search": "aje nova tie back midi dress - deep olive deep olive"
+  },
+  {
+    "id": "recNaah7ZfVjWaDeK",
+    "webflow_item_id": "6a7663408708d0cef2706222",
+    "name": "Unknown Tee - White Gold",
+    "slug": "unknown-tee-white-gold",
+    "designer": "Aje",
+    "category": "Tops",
+    "colour": "White Gold",
+    "product_code": "",
+    "rrp": null,
+    "image": "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a7663408708d0cef270621e_sV83PqVAmVmQSTpejPOogc5h5CLGmZg4W03wJAteekc.jpeg",
+    "search": "aje unknown tee - white gold white gold"
   }
 ]
