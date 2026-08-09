@@ -8,6 +8,10 @@ on:
         description: 'Dry run (no writes)'
         required: false
         default: 'false'
+      create_missing:
+        description: 'Phase 3: also create rows for sold comps never scraped active'
+        required: false
+        default: 'false'
 jobs:
   sync_and_check:
     runs-on: ubuntu-latest
@@ -15,15 +19,12 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Install dependencies
         run: pip install requests
-
       - name: Run listings sync + expiry check
         env:
           AIRTABLE_TOKEN:         ${{ secrets.AIRTABLE_TOKEN }}
@@ -34,12 +35,14 @@ jobs:
           SUPABASE_URL:           ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY:   ${{ secrets.SUPABASE_SERVICE_KEY }}
           DRY_RUN:                ${{ github.event.inputs.dry_run || 'false' }}
+          CREATE_MISSING:         ${{ github.event.inputs.create_missing || 'false' }}
         run: python scripts/listings_sync_and_expiry.py
-
-      - name: Upload unmatched report (if any)
+      - name: Upload reports (if any)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: expiry-checker-unmatched
-          path: expiry_checker_unmatched.json
+          name: listings-sync-reports
+          path: |
+            expiry_checker_unmatched.json
+            depop_manual_check_needed.json
           if-no-files-found: ignore
