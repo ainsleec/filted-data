@@ -2,6 +2,57 @@
 """
 Filted — Listings Sync + eBay Expiry Checker + Sold Verification (consolidated)
 
+=============================================================================
+2026-08 REVISION — Depop support added
+=============================================================================
+Previously eBay-only despite the generic name. Depop sightings added via
+the Airtable Web Clipper were silently dropped in Phase 1: extract_item_id()
+only checked the "eBay Item ID" field and a /itm/(\\d+) URL regex — both
+blank/non-matching for a Depop listing — so every Depop row hit
+`if not item_id: no_item_id += 1; continue` and never reached Supabase.
+
+REQUIRED SUPABASE MIGRATION — run this once, before this script's first run:
+
+    ALTER TABLE listings ADD COLUMN platform text NOT NULL DEFAULT 'ebay';
+    ALTER TABLE listings ADD COLUMN platform_item_id text;
+    UPDATE listings SET platform_item_id = ebay_item_id WHERE platform = 'ebay';
+    CREATE INDEX IF NOT EXISTS listings_platform_item_id_idx
+        ON listings (platform, platform_item_id);
+
+Why a new `platform_item_id` column instead of reusing `ebay_item_id` for
+everything: `ebay_item_id` is presumably read elsewhere (Worker endpoints,
+any admin tooling) as a real eBay item number — repurposing it to sometimes
+hold a Depop URL slug would be a silent breaking change for any code that
+assumes it's always a numeric eBay ID. Instead:
+  - `ebay_item_id` keeps being populated ONLY for platform='ebay' rows,
+    unchanged from before — nothing downstream that reads it breaks.
+  - `platform_item_id` is the new generic dedup key this script actually
+    uses going forward, populated for every platform (equal to
+    ebay_item_id's value on eBay rows, a derived slug on Depop rows).
+  - `platform` ('ebay' | 'depop') lets Phase 2 skip Depop rows instead of
+    sending a Depop URL to eBay's Browse API.
+
+DEPOP ID CAVEAT — Depop has no stable numeric item ID exposed in its URLs
+(https://www.depop.com/products/<seller>-<slug>/). This script derives a
+pseudo-ID from that <seller>-<slug> segment. That segment can change if the
+seller edits the listing title, which would make this script see it as a
+brand-new listing rather than a match — a real limitation, not a bug to be
+fixed here. Worth an eyeball on the `no_item_id`/orphan counts after the
+first few runs to see how often it actually happens in practice.
+
+PHASE 2 caveat — Depop has no public API for checking whether a listing is
+still live (unlike eBay's Browse API). Automated expiry-checking is eBay-
+only. Depop listings rely entirely on Airtable's Status field being updated
+by hand (same manual-verification pattern as Price Sold / Date Sold /
+Replica already are) — Phase 1's reconciliation picks up that manual change
+on the next run, same as it always has for eBay's manually-corrected rows.
+Phase 2 now explicitly skips non-eBay platforms and reports how many Depop
+Active listings are "due" for a manual look, rather than silently doing
+nothing and leaving you to wonder.
+
+=============================================================================
+(Original consolidation history preserved below)
+=============================================================================
 Was three separate scripts (listings_sync.py, expiry_checker.py, and
 sold_sync.py) on independent GitHub Actions schedules. Merged into one,
 run in strict sequence within a single job, to close two real gaps.
@@ -35,45 +86,13 @@ displays) and `ended_reason` (a leftover from an earlier schema
 iteration). Every write in this script sets BOTH columns together now,
 via a single shared write path, so they can never drift apart again.
 
-GAP 2 / FIFTH fix (this revision) — Sold Sync consolidation: the old
-standalone sold_sync.py ran on its own separate schedule, trusted to
-fire after this script by cron timing alone rather than anything
-structural, AND it only ever wrote `ended_reason` — never `end_reason` —
-meaning every hand-verified sale (the most trustworthy data in the whole
-pipeline) silently kept whichever `end_reason` guess Phase 2 had already
-made (usually "expired", since eBay's Browse API can't distinguish sold
-from just-ended). That's now Phase 3 below, sharing this script's single
-end-state write path (mark_sold_listing / create_sold_listing), so
-ordering is guaranteed by the code instead of two independent cron
-schedules, and end_reason/ended_reason can't split again for sold rows
-either.
+GAP 2 / FIFTH fix (prior revision) — Sold Sync consolidation: see prior
+revision notes in version control — merged sold_sync.py in as Phase 3.
 
-SIXTH fix (this revision) — aggregate stats were never recomputed: the
-`garments` table carries active_listing_count / listed_price_median /
-listed_price_min / listed_price_max columns, read by both the campaign
-embed's resale pill and search_garments()'s ranking tie-break — but
-nothing anywhere (no script, no Postgres trigger, no pg_cron job) ever
-recalculated them after each garment row was first created. They were
-frozen at whatever value existed on day one, silently drifting further
-from reality with every listing opened or closed since. Phase 4 below
-calls a Postgres function (recompute_garment_stats() — see
-recompute_garment_stats.sql, run once manually before this script's
-first run with this phase) that recalculates all four columns from
-CURRENTLY ACTIVE listings in one pass, at the end of every run.
+SIXTH fix (prior revision) — aggregate stats recompute (Phase 4).
 
-SEVENTH fix (this revision) — counterfeit/replica flagging: Ainslee
-manually spot-checks garments and identifies some eBay listings as
-selling a counterfeit/replica rather than a genuine piece. Rather than
-deleting those rows outright (which would (a) look like the listing was
-simply missed, and (b) get silently re-inserted on the next sync since
-nothing would tell this script the row was ever reviewed), a "Replica"
-checkbox field on the Resale Sightings table is now read and written
-through to Supabase's listings.is_replica column. The frontend uses this
-to fade the row and strip its outbound link rather than removing it, and
-excludes flagged rows from price-history averages. This script only ever
-READS "Replica" from Airtable and writes it to Supabase — the checkbox
-itself is set by hand in Airtable when a fake is spotted, same manual-
-verification pattern as Price Sold / Date Sold in Phase 3.
+SEVENTH fix (prior revision) — counterfeit/replica flagging via the
+"Replica" Airtable checkbox -> Supabase listings.is_replica.
 
 Run order within main(): sync, then expiry-check, then sold-verify, then
 recompute-stats — so every run starts from as complete a picture as this
@@ -88,7 +107,7 @@ Required env vars:
   SUPABASE_URL, SUPABASE_SERVICE_KEY
 
 Optional flags:
-  DRY_RUN=true         count/log only, no writes (covers all three phases)
+  DRY_RUN=true         count/log only, no writes (covers all phases)
   CREATE_MISSING=true  enable Phase 3's creation pass — inserts a Supabase
                         row for sold comps that were never scraped active
                         (off by default: match-update only, since creation
@@ -123,8 +142,7 @@ HEADERS_AT = {
 }
 
 UNMATCHED_REPORT_PATH = "expiry_checker_unmatched.json"
-
-ITEM_ID_URL_RE = re.compile(r"/itm/(\d+)")
+DEPOP_MANUAL_CHECK_REPORT_PATH = "depop_manual_check_needed.json"
 
 # Field names used specifically by Phase 3 (Sold verification) — matches
 # the exact Airtable field names from the old sold_sync.py's Sold view.
@@ -133,22 +151,71 @@ F_PRICE_SOLD = "Price Sold"
 # Airtable checkbox field, set by hand when a listing is confirmed to be
 # selling a counterfeit/replica garment. Read-only from this script's
 # perspective — never written back to Airtable, only read and mirrored
-# into Supabase's listings.is_replica column. See SEVENTH fix above.
+# into Supabase's listings.is_replica column.
 F_REPLICA = "Replica"
 
+# ── Platform detection ───────────────────────────────────────────────────
+# No dedicated "Platform" field exists in Airtable — platform is inferred
+# from the Listing URL's domain. If a dedicated field gets added later
+# (recommended — see note below), swap this to read it directly and use
+# the URL only as a fallback for older rows that predate the field.
+EBAY_ITEM_URL_RE  = re.compile(r"/itm/(\d+)")
+DEPOP_PRODUCT_URL_RE = re.compile(r"depop\.com/products/([^/?#]+)")
 
-def extract_item_id(item_id_field, listing_url):
-    """Shared by all three phases. Prefer the dedicated field; fall back
-    to parsing it out of the Listing URL when that field is blank —
-    this is the fix for sightings that only ever had the URL populated."""
+PLATFORM_EBAY  = "ebay"
+PLATFORM_DEPOP = "depop"
+PLATFORM_UNKNOWN = "unknown"
+
+
+def detect_platform(listing_url):
+    url = (listing_url or "").lower()
+    if "ebay." in url:
+        return PLATFORM_EBAY
+    if "depop.com" in url:
+        return PLATFORM_DEPOP
+    return PLATFORM_UNKNOWN
+
+
+def extract_platform_item_id(platform, item_id_field, listing_url):
+    """Replaces the old eBay-only extract_item_id(). Returns a
+    (platform_item_id, ebay_item_id) tuple — ebay_item_id is only ever
+    populated for platform='ebay', kept separate so the legacy column
+    stays exactly as reliable as it always was for anything downstream
+    still reading it directly.
+
+    eBay: prefer the dedicated field, fall back to parsing /itm/(\\d+)
+    out of the URL — unchanged from the original script.
+
+    Depop: no dedicated field and no numeric ID in the URL at all — the
+    <seller>-<slug> path segment from /products/<seller>-<slug>/ is used
+    as a pseudo-ID instead. This is stable as long as the seller doesn't
+    rename the listing (see module docstring caveat).
+
+    Unknown platform (URL didn't match either pattern — e.g. blank URL,
+    or some other marketplace not yet supported): falls back to whatever
+    is in the item-id-like field, otherwise blank. Rows that end up
+    blank are still skipped downstream exactly as before, just now also
+    logged with which platform was guessed so a genuinely new platform
+    shows up distinctly from "field just wasn't filled in."
+    """
+    if platform == PLATFORM_EBAY:
+        item_id = str(item_id_field or "").strip()
+        if not item_id and listing_url:
+            m = EBAY_ITEM_URL_RE.search(listing_url)
+            if m:
+                item_id = m.group(1)
+        return item_id, item_id  # (platform_item_id, ebay_item_id)
+
+    if platform == PLATFORM_DEPOP:
+        if listing_url:
+            m = DEPOP_PRODUCT_URL_RE.search(listing_url)
+            if m:
+                return m.group(1), None
+        return "", None
+
+    # Unknown platform — best-effort fallback, never populates ebay_item_id
     item_id = str(item_id_field or "").strip()
-    if item_id:
-        return item_id
-    if listing_url:
-        m = ITEM_ID_URL_RE.search(listing_url)
-        if m:
-            return m.group(1)
-    return ""
+    return item_id, None
 
 
 def parse_price(value):
@@ -256,16 +323,18 @@ def mark_sold_listing(listing_id, sold_price, sold_at):
     return resp.ok
 
 
-def create_sold_listing(item_id, url, garment_uuid, sold_price, sold_at,
+def create_sold_listing(platform, item_id, ebay_item_id, url, garment_uuid, sold_price, sold_at,
                          listed_price, date_listed, condition, title, seller,
                          is_replica=False):
     payload = {
-        "ebay_item_id": item_id,
-        "listing_url":  url,            # VERBATIM — keeps EPN affiliate params intact
-        "garment_id":   garment_uuid,
-        "end_reason":   "sold",
-        "ended_reason": "sold",
-        "is_replica":   bool(is_replica),
+        "platform":         platform,
+        "platform_item_id": item_id,
+        "ebay_item_id":      ebay_item_id,  # only ever non-null for platform='ebay'
+        "listing_url":       url,            # VERBATIM — keeps EPN affiliate params intact
+        "garment_id":        garment_uuid,
+        "end_reason":        "sold",
+        "ended_reason":      "sold",
+        "is_replica":        bool(is_replica),
     }
     if condition:    payload["condition"]    = condition
     if title:        payload["title"]        = title
@@ -279,7 +348,7 @@ def create_sold_listing(item_id, url, garment_uuid, sold_price, sold_at,
     if listed_price is not None:               # only a REAL ask; never sold_price
         payload["listed_price"] = listed_price
     if DRY_RUN:
-        print(f"   [DRY RUN] would create sold listing {item_id}: {payload}")
+        print(f"   [DRY RUN] would create sold listing ({platform}) {item_id}: {payload}")
         return True
     resp = requests.post(
         f"{SUPABASE_URL}/rest/v1/listings",
@@ -288,13 +357,13 @@ def create_sold_listing(item_id, url, garment_uuid, sold_price, sold_at,
         timeout=15,
     )
     if not resp.ok:
-        print(f"   ⚠️  Sold create FAILED for {item_id}: {resp.status_code} {resp.text[:150]}")
+        print(f"   ⚠️  Sold create FAILED for {platform}:{item_id}: {resp.status_code} {resp.text[:150]}")
     return resp.ok
 
 
 # ══════════════════════════════════════════════════════════════════════════
 # PHASE 1 — Sync: create any Supabase listings row that doesn't exist yet,
-# for a sighting of ANY status (not just Active/Sold).
+# for a sighting of ANY status (not just Active/Sold), across ANY platform.
 # ══════════════════════════════════════════════════════════════════════════
 
 def reconcile_stale_listings(items):
@@ -304,10 +373,10 @@ def reconcile_stale_listings(items):
     (different sold_price/sold_at per row), unlike mark_listings_ended's
     uniform batch update.
 
-    Also backfills ebay_item_id when the row's stored value is null but
-    this run derived one (via the dedicated field or the URL fallback) —
-    this is what lets a previously-unmatchable row become matchable by
-    future runs' Phase 2, instead of staying permanently stuck."""
+    Also backfills platform_item_id (and ebay_item_id, for eBay rows)
+    when the row's stored value is null but this run derived one — this
+    is what lets a previously-unmatchable row become matchable by future
+    runs' Phase 2, instead of staying permanently stuck."""
     now = datetime.now(timezone.utc).isoformat()
     succeeded, failed = 0, 0
 
@@ -320,8 +389,10 @@ def reconcile_stale_listings(items):
         if item["reason"] == "sold":
             patch["sold_price"] = item["sold_price"]
             patch["sold_at"] = item["sold_at"] or now
-        if item.get("backfill_item_id"):
-            patch["ebay_item_id"] = item["backfill_item_id"]
+        if item.get("backfill_platform_item_id"):
+            patch["platform_item_id"] = item["backfill_platform_item_id"]
+        if item.get("backfill_ebay_item_id"):
+            patch["ebay_item_id"] = item["backfill_ebay_item_id"]
 
         resp = requests.patch(
             f"{SUPABASE_URL}/rest/v1/listings",
@@ -342,37 +413,23 @@ def reconcile_stale_listings(items):
 
 def reactivate_relisted_listings(items):
     """Handles TRUE relists — new_listings.py's relist detection matches
-    an incoming eBay result on (seller, exact title) against an existing
+    an incoming result on (seller, exact title) against an existing
     Airtable record, and deliberately overwrites that record in place
-    with the new eBay Item ID/URL/price rather than creating a fresh
-    record — this preserves the garment match and avoids re-running
-    matching on every relist, which is the efficient behaviour we want
-    to keep.
-
-    But that means the matching Supabase row (found here via
-    airtable_id, since ebay_item_id itself just changed) would otherwise
-    keep pointing at the OLD, now-dead eBay Item ID forever — Phase 2
-    can never find it again by the new ID to verify or close it out, and
-    the prior price point vanishes with no trace it ever existed.
-
-    This snapshots the row's old listed_price/started_at into
-    price_history (appending to whatever's already there) before
-    overwriting, then refreshes ebay_item_id/listing_url/listed_price/
-    started_at to the new listing's values. If the row had already been
-    closed out under the old ID (e.g. a previous run's Phase 2 marked it
-    expired after the old listing vanished, not realising it was simply
-    relisted), this also reopens it — ended_at/end_reason/ended_reason/
-    sold_price/sold_at all cleared, since it's demonstrably active again
-    under the new ID."""
+    with the new item ID/URL/price rather than creating a fresh record.
+    Works identically across platforms — the only platform-specific bit
+    is which ID field changed, which is why this operates on
+    platform_item_id rather than ebay_item_id specifically."""
     succeeded, failed = 0, 0
     for item in items:
         patch = {
-            "ebay_item_id": item["new_item_id"],
-            "listing_url":  item["new_url"],
-            "listed_price": item["new_price"],
-            "started_at":   item["new_started_at"],
-            "price_history": item["price_history"],
+            "platform_item_id": item["new_item_id"],
+            "listing_url":      item["new_url"],
+            "listed_price":     item["new_price"],
+            "started_at":       item["new_started_at"],
+            "price_history":    item["price_history"],
         }
+        if item["platform"] == PLATFORM_EBAY:
+            patch["ebay_item_id"] = item["new_item_id"]
         if item["was_closed"]:
             patch.update({
                 "ended_at": None,
@@ -397,19 +454,22 @@ def reactivate_relisted_listings(items):
     return succeeded, failed
 
 
-def backfill_ebay_item_ids(items):
+def backfill_platform_item_ids(items):
     """Lightweight companion to reconcile_stale_listings — that function
-    only backfills ebay_item_id as a side effect of closing out a
-    Sold/Expired row. This handles the other half: a legacy row matched
-    via airtable_id whose ebay_item_id is still null but whose CURRENT
+    only backfills IDs as a side effect of closing out a Sold/Expired
+    row. This handles the other half: a legacy row matched via
+    airtable_id whose platform_item_id is still null but whose CURRENT
     Airtable status is Active."""
     succeeded, failed = 0, 0
     for item in items:
+        patch = {"platform_item_id": item["item_id"]}
+        if item["platform"] == PLATFORM_EBAY:
+            patch["ebay_item_id"] = item["item_id"]
         resp = requests.patch(
             f"{SUPABASE_URL}/rest/v1/listings",
             headers=get_supabase_headers(),
             params={"id": f"eq.{item['supabase_id']}"},
-            json={"ebay_item_id": item["item_id"]},
+            json=patch,
             timeout=15,
         )
         if resp.ok:
@@ -423,12 +483,8 @@ def backfill_ebay_item_ids(items):
 
 def update_replica_flags(items):
     """Patches is_replica on already-synced Supabase rows whose Airtable
-    Replica checkbox doesn't match what's currently stored — covers both
-    directions (a listing later confirmed as a fake, or a flag corrected
-    after being ticked in error). Runs every sync so a flag set by hand
-    in Airtable at any time reaches Supabase (and therefore the
-    frontend) on the very next run, without waiting for some other
-    change to that row to trigger a sync."""
+    Replica checkbox doesn't match what's currently stored. Platform-
+    agnostic — unchanged from before."""
     succeeded, failed = 0, 0
     for item in items:
         resp = requests.patch(
@@ -467,14 +523,14 @@ def insert_listings(rows):
                     inserted += 1
                 else:
                     errors += 1
-                    failed_rows.append((row.get("ebay_item_id"), r.status_code, r.text[:150]))
+                    failed_rows.append((row.get("platform"), row.get("platform_item_id"), r.status_code, r.text[:150]))
                 time.sleep(0.05)
         time.sleep(0.2)
 
     if failed_rows:
         print(f"\n   ⚠️  {len(failed_rows)} rows failed individually:")
-        for eid, code, msg in failed_rows[:15]:
-            print(f"      {eid} — {code} {msg}")
+        for plat, pid, code, msg in failed_rows[:15]:
+            print(f"      {plat}:{pid} — {code} {msg}")
         if len(failed_rows) > 15:
             print(f"      ...and {len(failed_rows) - 15} more")
 
@@ -483,19 +539,31 @@ def insert_listings(rows):
 
 def run_sync_phase():
     print("═" * 60)
-    print("PHASE 1 — Sync (Airtable → Supabase, any status)")
+    print("PHASE 1 — Sync (Airtable → Supabase, any status, any platform)")
     print("═" * 60)
 
     print("📊 Loading existing Supabase listings (for dedup + reconciliation)...")
     existing_listings = load_all_supabase_rows(
         "listings",
-        "id,ebay_item_id,airtable_id,ended_at,listed_price,started_at,price_history,is_replica"
+        "id,platform,platform_item_id,ebay_item_id,airtable_id,ended_at,listed_price,"
+        "started_at,price_history,is_replica"
     )
-    existing_ids = {str(r["ebay_item_id"]) for r in existing_listings if r.get("ebay_item_id")}
+    # Dedup key is (platform, platform_item_id) — NOT platform_item_id alone,
+    # since an eBay numeric ID and a Depop slug live in the same logical
+    # namespace but are never guaranteed disjoint by construction.
+    existing_keys = {
+        (r.get("platform") or PLATFORM_EBAY, str(r["platform_item_id"]))
+        for r in existing_listings if r.get("platform_item_id")
+    }
     existing_airtable_ids = {r["airtable_id"] for r in existing_listings if r.get("airtable_id")}
-    by_ebay_id = {str(r["ebay_item_id"]): r for r in existing_listings if r.get("ebay_item_id")}
+    by_key = {
+        (r.get("platform") or PLATFORM_EBAY, str(r["platform_item_id"])): r
+        for r in existing_listings if r.get("platform_item_id")
+    }
     by_airtable_id = {r["airtable_id"]: r for r in existing_listings if r.get("airtable_id")}
-    print(f"   {len(existing_ids)} existing listing IDs loaded")
+    print(f"   {len(existing_keys)} existing listing keys loaded "
+          f"({sum(1 for r in existing_listings if r.get('platform') == PLATFORM_DEPOP)} depop, "
+          f"{sum(1 for r in existing_listings if (r.get('platform') or PLATFORM_EBAY) == PLATFORM_EBAY)} ebay)")
 
     print("\n📊 Loading Supabase garments (for garment_id matching)...")
     garment_rows = load_all_supabase_rows("garments", "id,airtable_id")
@@ -513,9 +581,11 @@ def run_sync_phase():
     to_insert = []
     already_synced = already_by_at_id = no_item_id = no_garment_match = 0
     backfilled_ended = 0
+    unknown_platform_count = 0
+    depop_new_count = 0
     to_reconcile = []
     to_backfill_id_only = []
-    to_reactivate = []  # TRUE relists — same Airtable record, new eBay Item ID
+    to_reactivate = []  # TRUE relists — same Airtable record, new platform item ID
     to_update_replica = []  # is_replica changed on an already-synced row
 
     run_now_iso = datetime.now(timezone.utc).isoformat()
@@ -523,16 +593,23 @@ def run_sync_phase():
     for rec in sightings:
         f = rec["fields"]
         listing_url = f.get("Listing URL", "") or ""
-        item_id = extract_item_id(f.get("eBay Item ID"), listing_url)
+        platform = detect_platform(listing_url)
+        item_id, ebay_item_id = extract_platform_item_id(platform, f.get("eBay Item ID"), listing_url)
         status = f.get("Status")
         is_replica = bool(f.get(F_REPLICA))
+
+        if platform == PLATFORM_UNKNOWN:
+            unknown_platform_count += 1
 
         if not item_id:
             no_item_id += 1
             continue
-        if item_id in existing_ids:
+
+        key = (platform, item_id)
+
+        if key in existing_keys:
             already_synced += 1
-            existing_row = by_ebay_id.get(item_id)
+            existing_row = by_key.get(key)
             if existing_row and bool(existing_row.get("is_replica")) != is_replica:
                 to_update_replica.append({"supabase_id": existing_row["id"], "is_replica": is_replica})
             if status in ("Sold", "Expired"):
@@ -544,6 +621,7 @@ def run_sync_phase():
                         "sold_at": f.get("Date Sold") if status == "Sold" else None,
                     })
             continue
+
         if rec["id"] in existing_airtable_ids:
             already_by_at_id += 1
             existing_row = by_airtable_id.get(rec["id"])
@@ -551,27 +629,26 @@ def run_sync_phase():
                 to_update_replica.append({"supabase_id": existing_row["id"], "is_replica": is_replica})
             if status in ("Sold", "Expired"):
                 if existing_row and existing_row.get("ended_at") is None:
-                    needs_backfill = not existing_row.get("ebay_item_id")
+                    needs_backfill = not existing_row.get("platform_item_id")
                     to_reconcile.append({
                         "supabase_id": existing_row["id"],
                         "reason": "sold" if status == "Sold" else "expired",
                         "sold_price": f.get("Listed Price") if status == "Sold" else None,
                         "sold_at": f.get("Date Sold") if status == "Sold" else None,
-                        "backfill_item_id": item_id if needs_backfill else None,
+                        "backfill_platform_item_id": item_id if needs_backfill else None,
+                        "backfill_ebay_item_id": ebay_item_id if (needs_backfill and platform == PLATFORM_EBAY) else None,
                     })
-            elif existing_row and not existing_row.get("ebay_item_id"):
+            elif existing_row and not existing_row.get("platform_item_id"):
                 to_backfill_id_only.append({
                     "supabase_id": existing_row["id"],
                     "item_id": item_id,
+                    "platform": platform,
                 })
             elif status == "Active" and existing_row:
-                stored_item_id = str(existing_row.get("ebay_item_id") or "")
+                stored_item_id = str(existing_row.get("platform_item_id") or "")
                 if stored_item_id and item_id and stored_item_id != item_id:
-                    # TRUE RELIST: new_listings.py's relist detection matched
-                    # this Airtable record by (seller, title) and overwrote it
-                    # in place with a new eBay Item ID — the underlying
-                    # listing genuinely changed, it's not just a field edit.
-                    # Snapshot the old price/date before it's gone.
+                    # TRUE RELIST under a new platform item ID — snapshot
+                    # the old price/date before it's overwritten.
                     old_history = existing_row.get("price_history") or []
                     if existing_row.get("listed_price") is not None:
                         old_history = old_history + [{
@@ -580,6 +657,7 @@ def run_sync_phase():
                         }]
                     to_reactivate.append({
                         "supabase_id": existing_row["id"],
+                        "platform": platform,
                         "new_item_id": item_id,
                         "new_url": listing_url,
                         "new_price": f.get("Listed Price"),
@@ -598,21 +676,23 @@ def run_sync_phase():
         now_iso = datetime.now(timezone.utc).isoformat()
 
         row = {
-            "airtable_id":  rec["id"],
-            "garment_id":   garment_id,
-            "ebay_item_id": item_id,
-            "title":        f.get("eBay Title", "") or "",
-            "listing_url":  listing_url,
-            "seller_name":  f.get("Seller Name", "") or "",
-            "condition":    f.get("Condition", "") or "",
-            "listed_price": f.get("Listed Price"),
-            "started_at":   f.get("Date Listed") or None,
-            "sold_price":   None,
-            "sold_at":      None,
-            "ended_at":     None,
-            "end_reason":   None,
-            "ended_reason": None,
-            "is_replica":   is_replica,
+            "airtable_id":       rec["id"],
+            "garment_id":        garment_id,
+            "platform":          platform,
+            "platform_item_id":  item_id,
+            "ebay_item_id":      ebay_item_id,
+            "title":             f.get("eBay Title", "") or "",
+            "listing_url":       listing_url,
+            "seller_name":       f.get("Seller Name", "") or "",
+            "condition":         f.get("Condition", "") or "",
+            "listed_price":      f.get("Listed Price"),
+            "started_at":        f.get("Date Listed") or None,
+            "sold_price":        None,
+            "sold_at":           None,
+            "ended_at":          None,
+            "end_reason":        None,
+            "ended_reason":      None,
+            "is_replica":        is_replica,
         }
 
         if status == "Sold":
@@ -628,26 +708,30 @@ def run_sync_phase():
             row["ended_reason"] = "expired"
             backfilled_ended += 1
 
+        if platform == PLATFORM_DEPOP:
+            depop_new_count += 1
+
         to_insert.append(row)
-        existing_ids.add(item_id)
+        existing_keys.add(key)
         existing_airtable_ids.add(rec["id"])
 
-    print(f"\n   Already synced (by eBay ID): {already_synced}")
+    print(f"\n   Already synced (by platform+item id): {already_synced}")
     print(f"   Already synced (by airtable_id): {already_by_at_id}")
-    print(f"   Skipped — no eBay ID (field blank AND unparseable from URL): {no_item_id}")
+    print(f"   Skipped — no item ID (field/URL didn't resolve to one): {no_item_id}")
+    print(f"   Unknown platform (URL matched neither eBay nor Depop): {unknown_platform_count}")
     print(f"   No garment match (inserted anyway): {no_garment_match}")
     print(f"   New rows, already Sold/Expired at first sync (ended_at backfilled): {backfilled_ended}")
     print(f"   Existing rows needing reconciliation (Airtable already resolved, Supabase still open): {len(to_reconcile)}")
-    print(f"   Existing rows relisted under a new eBay Item ID: {len(to_reactivate)}")
-    print(f"   Existing Active rows needing ebay_item_id backfill only: {len(to_backfill_id_only)}")
+    print(f"   Existing rows relisted under a new platform item ID: {len(to_reactivate)}")
+    print(f"   Existing Active rows needing item-id backfill only: {len(to_backfill_id_only)}")
     print(f"   Existing rows with a changed Replica flag: {len(to_update_replica)}")
-    print(f"   🔧 New listings to insert: {len(to_insert)}")
+    print(f"   🔧 New listings to insert: {len(to_insert)}  (of which {depop_new_count} Depop)")
 
     if to_insert:
         if DRY_RUN:
             print(f"\n🧪 DRY RUN — would insert {len(to_insert)} new listings. No writes made.")
             for row in to_insert[:5]:
-                print(f"   • {row['ebay_item_id']} | {row['title'][:50]!r} | "
+                print(f"   • [{row['platform']}] {row['platform_item_id']} | {row['title'][:50]!r} | "
                       f"garment_id={row['garment_id']} | end_reason={row['end_reason']} | "
                       f"is_replica={row['is_replica']}")
         else:
@@ -660,9 +744,6 @@ def run_sync_phase():
     if to_reconcile:
         if DRY_RUN:
             print(f"\n🧪 DRY RUN — would reconcile {len(to_reconcile)} stale existing rows. No writes made.")
-            for r in to_reconcile[:5]:
-                tag = " (+ backfilling ebay_item_id)" if r.get("backfill_item_id") else ""
-                print(f"   • supabase_id={r['supabase_id']} -> reason={r['reason']}{tag}")
         else:
             print(f"\n📝 Reconciling {len(to_reconcile)} stale existing rows "
                   f"(Airtable already resolved, Supabase never closed out)...")
@@ -673,22 +754,19 @@ def run_sync_phase():
 
     if to_backfill_id_only:
         if DRY_RUN:
-            print(f"\n🧪 DRY RUN — would backfill ebay_item_id on {len(to_backfill_id_only)} Active rows. No writes made.")
+            print(f"\n🧪 DRY RUN — would backfill item id on {len(to_backfill_id_only)} Active rows. No writes made.")
         else:
-            print(f"\n📝 Backfilling ebay_item_id on {len(to_backfill_id_only)} still-Active legacy rows...")
-            bf_succeeded, bf_failed = backfill_ebay_item_ids(to_backfill_id_only)
+            print(f"\n📝 Backfilling item id on {len(to_backfill_id_only)} still-Active legacy rows...")
+            bf_succeeded, bf_failed = backfill_platform_item_ids(to_backfill_id_only)
             print(f"   {bf_succeeded} succeeded | {bf_failed} FAILED")
     else:
         print("\n   No Active rows needing ID-only backfill.")
 
     if to_reactivate:
         if DRY_RUN:
-            print(f"\n🧪 DRY RUN — would reactivate {len(to_reactivate)} relisted rows under new eBay Item IDs. No writes made.")
-            for r in to_reactivate[:5]:
-                print(f"   • supabase_id={r['supabase_id']} -> new item_id={r['new_item_id']} "
-                      f"(price history now has {len(r['price_history'])} point(s))")
+            print(f"\n🧪 DRY RUN — would reactivate {len(to_reactivate)} relisted rows. No writes made.")
         else:
-            print(f"\n📝 Reactivating {len(to_reactivate)} relisted rows under new eBay Item IDs...")
+            print(f"\n📝 Reactivating {len(to_reactivate)} relisted rows under new item IDs...")
             react_succeeded, react_failed = reactivate_relisted_listings(to_reactivate)
             print(f"   {react_succeeded} reactivated | {react_failed} FAILED")
     else:
@@ -697,8 +775,6 @@ def run_sync_phase():
     if to_update_replica:
         if DRY_RUN:
             print(f"\n🧪 DRY RUN — would update is_replica on {len(to_update_replica)} existing rows. No writes made.")
-            for r in to_update_replica[:10]:
-                print(f"   • supabase_id={r['supabase_id']} -> is_replica={r['is_replica']}")
         else:
             print(f"\n📝 Updating is_replica on {len(to_update_replica)} existing rows...")
             rep_succeeded, rep_failed = update_replica_flags(to_update_replica)
@@ -708,8 +784,16 @@ def run_sync_phase():
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# PHASE 2 — Expiry check: verify currently-Active sightings against eBay,
-# close out anything that's actually ended.
+# PHASE 2 — Expiry check: verify currently-Active EBAY sightings against
+# eBay's Browse API, close out anything that's actually ended.
+#
+# DEPOP: no public API exists for this, so Depop rows are explicitly
+# skipped here rather than silently ignored. Instead, Active Depop
+# sightings due for a recheck are counted and written to
+# depop_manual_check_needed.json so it's visible how many need a manual
+# look in Airtable — updating Status by hand there is picked up by
+# Phase 1's reconciliation on the very next run, same mechanism eBay
+# rows use when hand-corrected.
 # ══════════════════════════════════════════════════════════════════════════
 
 def mark_listings_ended(listing_ids, reason):
@@ -813,7 +897,7 @@ def push_updates(ended_ids, still_active_ids):
 
 def run_expiry_check_phase():
     print("\n" + "═" * 60)
-    print("PHASE 2 — Expiry check (verify Active sightings against eBay)")
+    print("PHASE 2 — Expiry check (eBay-only; Depop reported separately)")
     print("═" * 60)
 
     print("🔑 Fetching eBay OAuth token...")
@@ -823,9 +907,11 @@ def run_expiry_check_phase():
     print("\n📊 Loading active listings from Supabase...")
     sb_active = {}
     sb_all_ever = set()
-    rows = load_all_supabase_rows("listings", "id,ebay_item_id,ended_at")
+    rows = load_all_supabase_rows("listings", "id,platform,platform_item_id,ended_at")
     for r in rows:
-        eid = r.get("ebay_item_id")
+        if (r.get("platform") or PLATFORM_EBAY) != PLATFORM_EBAY:
+            continue  # non-eBay rows have no automated check path
+        eid = r.get("platform_item_id")
         if not eid:
             continue
         eid = str(eid)
@@ -833,7 +919,7 @@ def run_expiry_check_phase():
         if r.get("ended_at") is None:
             sb_active[eid] = r["id"]
     sb_listings = sb_active
-    print(f"   {len(sb_active)} active listings loaded ({len(sb_all_ever)} total rows including already-ended)")
+    print(f"   {len(sb_active)} active eBay listings loaded ({len(sb_all_ever)} total eBay rows including already-ended)")
 
     print("\n📦 Loading active sightings from Airtable...")
     recheck_cutoff = (datetime.now(timezone.utc) - timedelta(days=RECHECK_DAYS)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
@@ -842,17 +928,31 @@ def run_expiry_check_phase():
         filter_formula=(f'AND(Status = "Active", '
                          f'OR({{Last Checked}} = "", IS_BEFORE({{Last Checked}}, "{recheck_cutoff}")))'),
     )
-    print(f"   {len(all_sightings)} sightings due for checking")
+    print(f"   {len(all_sightings)} sightings due for checking (any platform)")
 
     fresh_cutoff = datetime.now(timezone.utc) - timedelta(days=MIN_AGE_DAYS)
     to_check, skipped_fresh, skipped_no_id = [], 0, 0
+    depop_due_for_manual_check = []
 
     for rec in all_sightings:
-        if len(to_check) >= BATCH_LIMIT:
-            break
         f = rec["fields"]
         url = f.get("Listing URL", "") or ""
-        item_id = extract_item_id(f.get("eBay Item ID"), url)
+        platform = detect_platform(url)
+
+        if platform != PLATFORM_EBAY:
+            # Depop (or unknown) — no automated check available. Track
+            # separately for the manual-check report rather than silently
+            # dropping it, so it's visible this isn't "0 due."
+            if platform == PLATFORM_DEPOP:
+                depop_due_for_manual_check.append({
+                    "airtable_record_id": rec["id"],
+                    "listing_url": url,
+                })
+            continue
+
+        if len(to_check) >= BATCH_LIMIT:
+            continue
+        item_id, _ = extract_platform_item_id(platform, f.get("eBay Item ID"), url)
         if not item_id:
             skipped_no_id += 1
             continue
@@ -866,7 +966,8 @@ def run_expiry_check_phase():
                 pass
         to_check.append({"id": rec["id"], "item_id": item_id})
 
-    print(f"   {len(to_check)} to check | {skipped_fresh} too fresh | {skipped_no_id} no ID/URL\n")
+    print(f"   {len(to_check)} eBay listings to check | {skipped_fresh} too fresh | {skipped_no_id} no ID/URL")
+    print(f"   {len(depop_due_for_manual_check)} Depop listings due for a manual check (no automated API available)\n")
 
     print("🔍 Checking eBay listing status...")
     ended_ids, ended_sb_ids, still_active_ids, unmatched = [], [], [], []
@@ -901,8 +1002,19 @@ def run_expiry_check_phase():
     if unmatched:
         with open(UNMATCHED_REPORT_PATH, "w") as fp:
             json.dump({"unmatched": unmatched, "count": len(unmatched)}, fp, indent=2)
-        print(f"\n⚠️  {len(unmatched)} unmatched even after Phase 1 — written to {UNMATCHED_REPORT_PATH}, "
-              f"worth investigating individually (different root cause than the original gap)")
+        print(f"\n⚠️  {len(unmatched)} unmatched even after Phase 1 — written to {UNMATCHED_REPORT_PATH}")
+
+    if depop_due_for_manual_check:
+        with open(DEPOP_MANUAL_CHECK_REPORT_PATH, "w") as fp:
+            json.dump({
+                "depop_active_due_for_check": depop_due_for_manual_check,
+                "count": len(depop_due_for_manual_check),
+                "note": "Depop has no public status-check API. Update Status by hand in "
+                        "Airtable for any of these that have sold or been removed — Phase 1's "
+                        "reconciliation will pick up the change on the next run.",
+            }, fp, indent=2)
+        print(f"📋 {len(depop_due_for_manual_check)} Depop listings due for a manual check "
+              f"— written to {DEPOP_MANUAL_CHECK_REPORT_PATH}")
 
     if not DRY_RUN:
         print(f"\n📝 Applying updates to Airtable...")
@@ -914,24 +1026,10 @@ def run_expiry_check_phase():
 
 # ══════════════════════════════════════════════════════════════════════════
 # PHASE 3 — Sold verification: Airtable is the source of truth for confirmed
-# sales. You verify a sale by hand, set Status = "Sold", and fill in
-# Price Sold + Date Sold. This is the ONLY phase that ever has a hand-
-# verified achieved price to work with — Phase 1/2 only ever guess
-# "expired" when a listing vanishes from eBay, since the Browse API can't
-# tell sold apart from just-ended.
-#
-# Two passes:
-#   MATCH-UPDATE (always): for every Sold sighting whose listing was
-#     already scraped active, find the Supabase row by ebay_item_id and
-#     overwrite Phase 2's earlier "expired" guess with the real outcome —
-#     via mark_sold_listing(), the shared write path that sets BOTH
-#     end_reason and ended_reason together.
-#   CREATE-MISSING (when CREATE_MISSING=true): many sold comps were never
-#     scraped active (the sale was found directly, already completed).
-#     Those have no listings row yet — this pass inserts one, joined to
-#     the right garment, so the achieved price feeds per-garment stats.
-#     Rows that can't resolve a garment are REPORTED as orphans, not
-#     inserted.
+# sales, across every platform equally. You verify a sale by hand, set
+# Status = "Sold", and fill in Price Sold + Date Sold — this is doubly
+# important for Depop now, since Phase 2 can never do it automatically
+# there the way it can for eBay.
 # ══════════════════════════════════════════════════════════════════════════
 
 def load_sold_sightings():
@@ -947,15 +1045,18 @@ def load_sold_sightings():
 
 def run_sold_sync_phase():
     print("\n" + "═" * 60)
-    print("PHASE 3 — Sold verification (Airtable hand-verified sales → Supabase)")
+    print("PHASE 3 — Sold verification (Airtable hand-verified sales → Supabase, any platform)")
     print("═" * 60)
     if CREATE_MISSING:
         print("   CREATE_MISSING enabled — will also insert rows for sold comps never scraped active")
 
     print("\n📊 Loading Supabase listing map...")
-    listing_rows = load_all_supabase_rows("listings", "id,ebay_item_id")
-    listing_map = {str(r["ebay_item_id"]).strip(): r["id"] for r in listing_rows if r.get("ebay_item_id")}
-    print(f"   {len(listing_map)} listings with an eBay item ID")
+    listing_rows = load_all_supabase_rows("listings", "id,platform,platform_item_id")
+    listing_map = {
+        (r.get("platform") or PLATFORM_EBAY, str(r["platform_item_id"]).strip()): r["id"]
+        for r in listing_rows if r.get("platform_item_id")
+    }
+    print(f"   {len(listing_map)} listings with a platform item ID")
 
     garment_map = {}
     if CREATE_MISSING:
@@ -975,18 +1076,22 @@ def run_sold_sync_phase():
 
     for rec in sold:
         f = rec.get("fields", {})
-        item_id = extract_item_id(f.get("eBay Item ID"), f.get("Listing URL", ""))
+        listing_url = f.get("Listing URL", "")
+        platform = detect_platform(listing_url)
+        item_id, ebay_item_id = extract_platform_item_id(platform, f.get("eBay Item ID"), listing_url)
         if not item_id:
             no_id += 1
             continue
 
+        key = (platform, item_id)
+
         # Pass 1: update an existing listing
-        if item_id in listing_map:
+        if key in listing_map:
             price   = parse_price(f.get(F_PRICE_SOLD))
             sold_at = parse_date(f.get("Date Sold"))
             if price is None:
                 no_price += 1
-            if mark_sold_listing(listing_map[item_id], price, sold_at):
+            if mark_sold_listing(listing_map[key], price, sold_at):
                 updated += 1
             else:
                 errors += 1
@@ -998,16 +1103,16 @@ def run_sold_sync_phase():
         if not CREATE_MISSING:
             unmatched += 1
             if len(unmatched_samples) < 10:
-                unmatched_samples.append((item_id, f.get("Listing URL", "")))
+                unmatched_samples.append((platform, item_id, listing_url))
             continue
 
         garment_uuid = garment_map.get(str(first_linked(f.get("Garment")) or "").strip())
         if not garment_uuid:
             orphaned += 1
             if len(orphan_samples) < 15:
-                orphan_samples.append((item_id, f.get("eBay Title", ""), first_linked(f.get("Garment"))))
+                orphan_samples.append((platform, item_id, f.get("eBay Title", ""), first_linked(f.get("Garment"))))
             continue
-        if item_id in created_ids:
+        if key in created_ids:
             continue
 
         price   = parse_price(f.get(F_PRICE_SOLD))
@@ -1019,13 +1124,13 @@ def run_sold_sync_phase():
             created_no_price += 1
 
         if create_sold_listing(
-            item_id, f.get("Listing URL"), garment_uuid, price, sold_at,
+            platform, item_id, ebay_item_id, listing_url, garment_uuid, price, sold_at,
             listed, dlisted, f.get("Condition"), f.get("eBay Title"), f.get("Seller Name"),
             is_replica=is_replica,
         ):
             created += 1
-            created_ids.add(item_id)
-            listing_map[item_id] = "new"   # guard against in-run dupes
+            created_ids.add(key)
+            listing_map[key] = "new"   # guard against in-run dupes
         else:
             errors += 1
         if not DRY_RUN:
@@ -1045,32 +1150,19 @@ def run_sold_sync_phase():
 
     if unmatched_samples:
         print("\n   Sample unmatched:")
-        for iid, url in unmatched_samples:
-            print(f"      {iid}  {url}")
+        for plat, iid, url in unmatched_samples:
+            print(f"      [{plat}] {iid}  {url}")
     if orphan_samples:
         print("\n   Sample orphans (sold, but garment not in Supabase — eyeball for junk):")
-        for iid, title, gid in orphan_samples:
-            print(f"      {iid}  garment={gid}  {str(title)[:60]}")
+        for plat, iid, title, gid in orphan_samples:
+            print(f"      [{plat}] {iid}  garment={gid}  {str(title)[:60]}")
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# PHASE 4 — Recompute garment aggregate stats: active_listing_count,
-# listed_price_median, listed_price_min, listed_price_max on the
-# `garments` table. These are read by the campaign embed's resale pill
-# and by search_garments()'s ranking tie-break, but nothing has ever
-# recalculated them after each garment row's initial creation (confirmed:
-# no Postgres function beyond search_garments(), no triggers on any
-# table, pg_cron not even enabled). Calls a single Postgres function
-# (recompute_garment_stats(), defined in recompute_garment_stats.sql —
-# run that once manually before this script's first run with this phase)
-# so the aggregation itself happens inside the database rather than
-# pulling every listings row into Python to compute a median.
-#
-# NOTE: recompute_garment_stats.sql should be reviewed to confirm it
-# excludes is_replica=true rows from listed_price_median/min/max —
-# otherwise a flagged counterfeit's price still quietly skews the
-# aggregate figures shown on campaign embeds even though the garment
-# page itself now excludes it from its own price-history display.
+# PHASE 4 — Recompute garment aggregate stats. Unchanged by the Depop work
+# — recompute_garment_stats() aggregates from listings regardless of
+# platform, which is the correct behaviour (a Depop sale is just as real
+# a price point as an eBay one for the median/min/max shown on the site).
 # ══════════════════════════════════════════════════════════════════════════
 
 def run_recompute_stats_phase():
@@ -1094,15 +1186,12 @@ def run_recompute_stats_phase():
               "listed_price_median, listed_price_min, listed_price_max)")
     else:
         print(f"   ⚠️  Recompute FAILED: {resp.status_code} {resp.text[:300]}")
-        print("   NOTE: if this is the first run with this phase, confirm you've run "
-              "recompute_garment_stats.sql once in the Supabase SQL editor first — "
-              "this call will 404/error if that function doesn't exist yet.")
 
 
 # ══════════════════════════════════════════════════════════════════════════
 def main():
     run_start = datetime.now(timezone.utc)
-    print(f"🔄 Filted — Listings Sync + Expiry Check + Sold Verification (consolidated)")
+    print(f"🔄 Filted — Listings Sync + Expiry Check + Sold Verification (eBay + Depop)")
     print(f"   {run_start.strftime('%Y-%m-%d %H:%M UTC')}")
     if DRY_RUN:
         print("   🧪 DRY RUN MODE — no writes will be made")
