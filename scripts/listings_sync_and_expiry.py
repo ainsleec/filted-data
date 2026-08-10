@@ -503,6 +503,32 @@ def update_replica_flags(items):
     return succeeded, failed
 
 
+def update_garment_ids(items):
+    """Patches garment_id on already-synced Supabase rows whose Airtable
+    Garment link doesn't match what's currently stored — this is the fix
+    for correcting a mismatched sighting purely in Airtable and having it
+    propagate on the next scheduled sync, instead of requiring a manual
+    SQL UPDATE every time (see the vacation-maxi-dress-black cleanup).
+    new_garment_id may legitimately be None (Airtable's Garment field was
+    cleared) — that's sent through as-is, unlinking the listing."""
+    succeeded, failed = 0, 0
+    for item in items:
+        resp = requests.patch(
+            f"{SUPABASE_URL}/rest/v1/listings",
+            headers=get_supabase_headers(),
+            params={"id": f"eq.{item['supabase_id']}"},
+            json={"garment_id": item["new_garment_id"]},
+            timeout=15,
+        )
+        if resp.ok:
+            succeeded += 1
+        else:
+            failed += 1
+            print(f"   ⚠️  Garment reassignment FAILED for {item['supabase_id']}: {resp.status_code} {resp.text[:150]}")
+        time.sleep(0.05)
+    return succeeded, failed
+
+
 def insert_listings(rows):
     """Bulk insert in batches of 50. On batch failure, retry rows individually
     so one bad row doesn't sink the other 49 good ones."""
@@ -546,7 +572,7 @@ def run_sync_phase():
     existing_listings = load_all_supabase_rows(
         "listings",
         "id,platform,platform_item_id,ebay_item_id,airtable_id,ended_at,listed_price,"
-        "started_at,price_history,is_replica"
+        "started_at,price_history,is_replica,garment_id"
     )
     # Dedup key is (platform, platform_item_id) — NOT platform_item_id alone,
     # since an eBay numeric ID and a Depop slug live in the same logical
@@ -587,6 +613,7 @@ def run_sync_phase():
     to_backfill_id_only = []
     to_reactivate = []  # TRUE relists — same Airtable record, new platform item ID
     to_update_replica = []  # is_replica changed on an already-synced row
+    to_update_garment = []  # Garment link changed on an already-synced row (mismatch fix)
 
     run_now_iso = datetime.now(timezone.utc).isoformat()
 
@@ -607,11 +634,35 @@ def run_sync_phase():
 
         key = (platform, item_id)
 
+        # Resolve what garment this sighting is CURRENTLY linked to in
+        # Airtable, right now, regardless of what Supabase has stored.
+        # None is a valid, meaningful value here — it means "unlinked in
+        # Airtable" and should propagate as garment_id=null in Supabase,
+        # not be skipped.
+        linked_garments_now = f.get("Garment", [])
+        garment_airtable_id_now = linked_garments_now[0] if linked_garments_now else None
+        correct_garment_id_now = garment_lookup.get(garment_airtable_id_now) if garment_airtable_id_now else None
+
         if key in existing_keys:
             already_synced += 1
             existing_row = by_key.get(key)
             if existing_row and bool(existing_row.get("is_replica")) != is_replica:
                 to_update_replica.append({"supabase_id": existing_row["id"], "is_replica": is_replica})
+            # FIX: previously a Garment link change on an already-synced
+            # sighting was never detected — Airtable is the source of
+            # truth for which garment a sighting belongs to, but nothing
+            # here compared it against Supabase's stored garment_id on
+            # subsequent runs. That's what forced manual SQL every time
+            # a mismatched sighting got corrected in Airtable. Now any
+            # difference (including correcting TO or FROM unlinked/None)
+            # gets queued for a fix on this run.
+            if existing_row and existing_row.get("garment_id") != correct_garment_id_now:
+                to_update_garment.append({
+                    "supabase_id": existing_row["id"],
+                    "old_garment_id": existing_row.get("garment_id"),
+                    "new_garment_id": correct_garment_id_now,
+                    "title": existing_row.get("title") or f.get("eBay Title", ""),
+                })
             if status in ("Sold", "Expired"):
                 if existing_row and existing_row.get("ended_at") is None:
                     to_reconcile.append({
@@ -627,6 +678,13 @@ def run_sync_phase():
             existing_row = by_airtable_id.get(rec["id"])
             if existing_row and bool(existing_row.get("is_replica")) != is_replica:
                 to_update_replica.append({"supabase_id": existing_row["id"], "is_replica": is_replica})
+            if existing_row and existing_row.get("garment_id") != correct_garment_id_now:
+                to_update_garment.append({
+                    "supabase_id": existing_row["id"],
+                    "old_garment_id": existing_row.get("garment_id"),
+                    "new_garment_id": correct_garment_id_now,
+                    "title": existing_row.get("title") or f.get("eBay Title", ""),
+                })
             if status in ("Sold", "Expired"):
                 if existing_row and existing_row.get("ended_at") is None:
                     needs_backfill = not existing_row.get("platform_item_id")
@@ -725,6 +783,7 @@ def run_sync_phase():
     print(f"   Existing rows relisted under a new platform item ID: {len(to_reactivate)}")
     print(f"   Existing Active rows needing item-id backfill only: {len(to_backfill_id_only)}")
     print(f"   Existing rows with a changed Replica flag: {len(to_update_replica)}")
+    print(f"   Existing rows with a changed Garment link (mismatch fix): {len(to_update_garment)}")
     print(f"   🔧 New listings to insert: {len(to_insert)}  (of which {depop_new_count} Depop)")
 
     if to_insert:
@@ -781,6 +840,20 @@ def run_sync_phase():
             print(f"   {rep_succeeded} succeeded | {rep_failed} FAILED")
     else:
         print("\n   No Replica flag changes to apply.")
+
+    if to_update_garment:
+        if DRY_RUN:
+            print(f"\n🧪 DRY RUN — would reassign garment_id on {len(to_update_garment)} existing rows. No writes made.")
+            for item in to_update_garment[:10]:
+                print(f"   • {item['supabase_id']}  {item['old_garment_id']} -> {item['new_garment_id']}  "
+                      f"({str(item['title'])[:50]!r})")
+        else:
+            print(f"\n📝 Reassigning garment_id on {len(to_update_garment)} existing rows "
+                  f"(Airtable Garment link changed since last sync)...")
+            garm_succeeded, garm_failed = update_garment_ids(to_update_garment)
+            print(f"   {garm_succeeded} succeeded | {garm_failed} FAILED")
+    else:
+        print("\n   No Garment link changes to apply.")
 
 
 # ══════════════════════════════════════════════════════════════════════════
