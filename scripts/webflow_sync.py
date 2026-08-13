@@ -35,281 +35,30 @@ not 'listed-price'). Treat every *_FIELD_SLUG constant below as a
 placeholder to verify, not a confirmed value.
 
 --------------------------------------------------------------------------
-2026-07 REVISION NOTES (slug bug fixes):
+2026-08 REVISION NOTES (multi-image sync — only Image 1 was ever sent):
 
-1. slugify() previously did not strip accented characters. Python 3's
-   \\w in regex already matches Unicode word characters, so "Allégro"
-   passed straight through the "strip non-word-chars" step unchanged and
-   was sent to Webflow as "allégro-..." — which fails Webflow's slug
-   validation pattern (^[_a-zA-Z0-9][-_a-zA-Z0-9]*$) outright on every
-   POST (new item creation). Fixed by transliterating to ASCII first via
-   unicodedata NFKD normalization before the regex ever runs.
+9. Only Image 1 (Webflow slug main-photo) was ever read from Airtable and
+   sent to Webflow — Image 2 through Image 7 in Airtable were populated
+   but never synced, so garment pages only ever showed one photo despite
+   more being available. This mapping existed in an earlier version of
+   this pipeline (filted_airtable_webflow_sync.py) but was dropped during
+   the consolidation into this file.
 
-2. build_slug() previously had NO collision detection in code at all —
-   uniqueness relied entirely on a manual pre-run check described in the
-   old docstring ("verified manually before each run rather than
-   enforced in code"). Any two garments sharing an identical Name+Colour
-   combination (most commonly ones with a blank Product Code, so no
-   fallback value existed either) collided outright on PATCH with
-   "Unique value is already in database" — silently failing every run
-   since nothing caught it upstream.
+   Confirmed live Webflow slugs (2026-08, via GET /v2/collections/{id}):
+     Image 1 -> main-photo
+     Image 2 -> image-2
+     Image 3 -> model-back
+     Image 4 -> image-3
+     Image 5 -> image-4
+     Image 6 -> image-5
+     Image 7 -> image-7
+   (Image 8 in Airtable has no corresponding Webflow field — the
+   collection only has 7 image slots — so it is not synced.)
 
-   Fixed by loading every live slug from the Webflow Garments collection
-   once at the start of sync_garments(), and giving build_slug() a real
-   fallback chain: base slug -> base+product-code -> base+numeric
-   suffix. The in-memory existing_slugs map is updated after each
-   successful create/update too, so collisions between two *new* items
-   in the same run are also caught, not just collisions against
-   already-live items.
-
---------------------------------------------------------------------------
-2026-07 REVISION NOTES (rate-limit fixes):
-
-3. webflow_all_items() previously called requests.get() directly with no
-   retry handling and no throttling — the slug-preload fetch alone is
-   70+ back-to-back requests against the ~7,000-item Garments collection,
-   which blows straight through Webflow's 60 requests/minute limit and
-   killed a full production run with an uncaught 429 at offset 2200
-   (before a single garment had synced). Fixed two ways:
-
-   a. Every Webflow call in this file — including plain GETs, item
-      lookups, and pagination — now routes through webflow_request(),
-      which retries on 429 (respecting Retry-After) and 5xx. No raw
-      requests.get/post/patch against api.webflow.com remains anywhere.
-
-   b. webflow_all_items() also throttles proactively with a 1.1s sleep
-      between pages (~54 req/min ceiling), so the preload rarely needs
-      the retry path at all. Adds ~80s to a full 7,000-item fetch —
-      negligible in a GitHub Actions run, and makes the fetch
-      deterministic instead of dependent on how much request budget the
-      campaign/designer phases happened to consume beforehand.
-
-   webflow_request() also gained `params` (for paginated GETs) and
-   `allow_404` (so webflow_get_item's existing 404 -> None contract is
-   preserved through the shared wrapper).
-
---------------------------------------------------------------------------
-2026-07 REVISION NOTES (incremental garment sync):
-
-4. Garments are now synced INCREMENTALLY: only garments modified in
-   Airtable since the last successful run (plus any garment with a blank
-   Webflow Item ID, i.e. never created) are actually processed. A full
-   ~7,000-garment run is at minimum ~14,000 Webflow calls (GET + PATCH
-   each) — roughly four hours at the 60/min rate limit, uncomfortably
-   close to GitHub Actions' six-hour job kill. A typical daily run
-   touches a few dozen garments, not thousands.
-
-   How it works:
-   - The last successful sync time is stored in webflow_last_sync.txt,
-     committed to the repo by the Actions workflow (same pattern as the
-     old pipeline's GitHub-stored incremental timestamps). Missing file
-     -> full sync. FULL_SYNC=true env var forces a full run regardless.
-   - Modified detection is a single extra server-side Airtable fetch
-     using a field-scoped LAST_MODIFIED_TIME() in filterByFormula —
-     scoped to the exact fields this script pushes to Webflow, so
-     unrelated writes (e.g. listings_sync.py touching sighting rollups)
-     don't trigger pointless re-syncs. NOTE: LAST_MODIFIED_TIME cannot
-     track formula fields, so "Name (Formula)" is covered via its input
-     fields (Garment Name, Product Colour) — if the formula ever gains
-     another input field, add it to MODIFIED_TRACKED_FIELDS below.
-   - Campaigns and Designers still sync in FULL every run — they're tiny
-     (dozens of items) and campaign scope must come from the full
-     qualifying set, or a campaign only referenced by unmodified
-     garments would silently stop updating.
-   - garments.json is now MERGED, not overwritten: the previous file's
-     entries are kept and only re-synced garments replace their old
-     entry. Otherwise an incremental run would shrink the search index
-     to just that day's modified garments. (Garments are create-once-
-     permanent, so no removal pass is needed.)
-   - The timestamp only advances when a run finishes with ZERO garment
-     failures — so a failed garment is retried on the next run rather
-     than falling permanently outside the modified window. Cost: the
-     other garments in that (small) modified window get re-updated once.
-   - The new timestamp is the run's START time, not its end — so records
-     edited while a long run is in progress are picked up next run
-     instead of slipping through the gap.
-
-   WORKFLOW CHANGE REQUIRED: the GitHub Actions workflow must commit
-   webflow_last_sync.txt alongside garments.json after the run, or every
-   run will be a full sync forever.
-
---------------------------------------------------------------------------
-2026-07 REVISION NOTES (image_url never reached Supabase):
-
-5. garments.image_url in Supabase was null for EVERY garment, real or
-   otherwise — this was the root cause of broken image icons across the
-   /find search results page (surfaced 2026-07-21 debugging the "senses"
-   duplicate-card issue, which turned out to be a separate Airtable-side
-   duplication bug — see the cleanup done directly in Supabase for that).
-
-   field_data[WF_FIELD_IMAGE_1] was always being sent TO Webflow on every
-   create/update, but nothing ever wrote the resulting URL back to
-   Supabase — update_supabase_garment_slug() only ever touched the slug
-   column. Fixed by adding update_supabase_garment_image(), called
-   alongside the slug update on every garment.
-
-   While fixing this, found a second, subtler bug in the same area: the
-   local `image_url` variable was being set from Airtable's OWN
-   attachment URL (f.get(FLD_IMAGE_1)[0]["url"]) — a signed URL that
-   Airtable expires after a period — not from Webflow's actual hosted
-   CDN URL, despite a comment in this file explicitly claiming it was
-   "Webflow's own asset URL — permanent, no expiry." That claim wasn't
-   true. This also affected garments.json, which has been shipping the
-   same expiring URL to every consumer of that file, silently, since it
-   was first written.
-
-   Fixed by reading the real Webflow-hosted URL back out of the
-   create/update API response (Webflow echoes the resolved CDN URL in
-   fieldData once an image is attached) and using THAT as the canonical
-   image_url for both the Supabase write-back and the garments.json
-   export — falling back to the Airtable URL only in DRY_RUN, where no
-   real Webflow write happens and there's nothing else to fall back to.
-
-   This is an incremental-sync-safe fix: on the next real run, only
-   garments already flagged as modified/new get reprocessed and get a
-   correct image_url; use FULL_SYNC=true once to backfill image_url for
-   every already-synced garment in one pass, since normal incremental
-   runs won't touch untouched historical rows.
-
---------------------------------------------------------------------------
-2026-07 REVISION NOTES (garment duplication — Airtable write-back gap):
-
-6. Root cause of duplicate Webflow garment items (same Name, different
-   slug, both live): the create path calls webflow_create_item() (which
-   IS retry-protected via webflow_request()) and then immediately calls
-   airtable_update() to write the new Webflow Item ID back onto the
-   Airtable record — but airtable_update() was a bare requests.patch()
-   with no retry handling at all. Airtable's own rate limit (5 req/sec)
-   is easy to hit during a run that's also hitting Webflow and Supabase
-   in the same loop.
-
-   When that write-back PATCH failed, the garment landed in `failures`,
-   which meant webflow_last_sync.txt did NOT advance — so the garment
-   stayed inside the "modified/blank ID" window for the next run. That
-   next run saw a blank Webflow Item ID in Airtable (because the write-
-   back never landed) and treated the garment as never-created, calling
-   build_slug() with self_wf_id=None. build_slug() correctly saw the base
-   slug already taken in the live-slugs map, but since self_wf_id was
-   None it couldn't recognize the taken slug as "itself" — so it fell
-   through to the numeric-suffix fallback and created a SECOND Webflow
-   item: same visible Name, different slug.
-
-   Fixed two ways (INCOMPLETE — see revision note 8 below, this fix had
-   an ordering bug that meant it didn't actually catch the case it was
-   built for):
-   a. airtable_request()/airtable_update() now retry on 429/5xx with the
-      same backoff pattern webflow_request() already uses, so a
-      transient rate-limit hit no longer silently drops the write-back.
-   b. Defensive fallback in sync_garments(): before creating a new item,
-      if the computed slug is already present in the live-slugs map
-      (loaded once per run for collision detection anyway), that item is
-      adopted as "existing" and updated in place instead of a duplicate
-      being created — and the recovered ID is written straight back to
-      Airtable. This closes the gap even for some other future failure
-      mode that leaves Airtable's ID blank while a live item exists.
-
---------------------------------------------------------------------------
-2026-08 REVISION NOTES (webflow_item_id never reached Supabase):
-
-7. Supabase's garments.webflow_item_id was null for the vast majority of
-   garments (confirmed 6,819 of ~7,000 via a direct count) — same shape
-   of bug as revision note 5's image_url gap, just on a different column,
-   and undiscovered until now because it doesn't break anything visibly —
-   it silently hides garments from search instead of showing a broken
-   icon. search_garments() filters to `webflow_item_id is not null`, so
-   any garment whose Supabase row was created with this column blank has
-   been permanently invisible in site search ever since, regardless of
-   being live, published, and fully correct on Webflow itself — surfaced
-   2026-08 investigating garments findable in Webflow CMS but absent from
-   filted.com.au's own search results (e.g. "Belonging Mini Dress",
-   "Belonging Short", "Belonging Flared Midi Dress" — all published,
-   none searchable).
-
-   Root cause: this script writes slug (update_supabase_garment_slug)
-   and image_url (update_supabase_garment_image) back to Supabase on
-   every sync, alongside the Webflow write — but there was never an
-   equivalent write for webflow_item_id itself. Whatever process
-   originally created these Supabase rows (see module docstring: this
-   script only ever looks up an existing row by airtable_id, it never
-   creates one) evidently left webflow_item_id blank at creation time,
-   and nothing since has ever gone back to fill it in.
-
-   Fixed by adding update_supabase_garment_webflow_id(), called
-   alongside the slug/image write-backs on every garment sync (both
-   the create and update paths, since existing_wf_id can itself have
-   been blank/stale for a garment being updated in place).
-
-   Same as the image_url fix's shape: this is incremental-sync-safe
-   going forward (only touched garments get corrected), but the ~6,819
-   ALREADY-affected rows need a one-time backfill, since normal
-   incremental runs won't touch untouched historical rows. See the
-   separate backfill_webflow_item_id.py script — it reads the correct
-   airtable_id -> webflow_item_id mapping straight out of the committed
-   garments.json (which HAS always had this value correct, since
-   export_garments_json() below was never missing it) rather than
-   re-querying Airtable/Webflow for ~7,000 records again.
-
---------------------------------------------------------------------------
-2026-08 REVISION NOTES (recovery fallback ran too late — new duplicates
-still being created for garments with a blank Webflow Item ID):
-
-8. Root cause: several garments turned up live on Webflow but still
-   completely absent from Airtable's "Webflow Item ID" column — i.e.
-   exactly the scenario revision note 6's "defensive fallback" was
-   supposed to catch and recover from. It didn't, because of an
-   ordering bug in that fix.
-
-   The old code computed new_slug via build_slug() FIRST, using
-   self_wf_id=existing_wf_id (which is None for a garment whose write-
-   back previously failed) — and only checked for an adoptable existing
-   item AFTER, using that already-computed new_slug:
-
-       new_slug = build_slug(..., self_wf_id=existing_wf_id)   # existing_wf_id is None
-       existing_item = webflow_get_item(...) if existing_wf_id else None
-       if not existing_item and new_slug in existing_slugs:      # never true — see below
-           ...adopt...
-
-   Inside build_slug(), the taken() check is:
-
-       owner = existing_slugs.get(candidate)
-       return owner is not None and owner != self_wf_id
-
-   With self_wf_id=None, the garment's OWN live item (sitting in
-   existing_slugs under its base slug, owned by its real Webflow item
-   ID) reads as "taken by someone else" — because the real owner ID is
-   never equal to None. So build_slug() walked straight past the base
-   slug into its fallback chain (base+product-code, then base+numeric
-   suffix) and returned a slug that was NEVER live on Webflow. The
-   recovery check right after then looked for THAT fallback slug in
-   existing_slugs — which of course wasn't there, since it was newly
-   invented — so `not existing_item and new_slug in existing_slugs`
-   was always False for exactly the garments this fallback existed to
-   catch. The script fell through to webflow_create_item(), creating a
-   duplicate item under the fallback slug. If the write-back for THAT
-   create also failed, the result is indistinguishable from the
-   original bug: live on Webflow, blank in Airtable — just with an
-   extra orphaned duplicate item now sitting in the collection too.
-
-   Fixed by reordering: compute the garment's plain base slug (no
-   fallback chain) FIRST and check it against existing_slugs BEFORE
-   calling build_slug() at all. If the base slug is live and this
-   garment has no existing_wf_id, adopt that live item's ID as
-   existing_wf_id right away — THEN call build_slug() with the now-
-   correct self_wf_id, so taken() recognizes the slug as belonging to
-   "itself" and returns the base slug unchanged rather than inventing a
-   new one. This makes the create-vs-update branch later in the loop
-   correctly take the update path instead of create.
-
-   Also added: a startup reconciliation pass (reconcile_orphaned_items())
-   that scans every live Webflow item's Airtable Record ID field
-   (WF_FIELD_AIRTABLE_ID) against Airtable's own Webflow Item ID column,
-   and backfills Airtable directly for any garment where a live Webflow
-   item already references it but Airtable's own column is still blank
-   — independent of slug matching, so it also catches any already-
-   orphaned duplicates left over from the bug above before this run's
-   sync logic even starts. This runs once per invocation, using the same
-   existing_items list already fetched for slug-collision loading (no
-   extra Webflow calls).
+   Fixed by generalizing the single-image block in sync_garments() into
+   a loop over IMAGE_FIELD_MAP, and adding an image_url_n field to each
+   synced-garment record so a future garments.json consumer could use
+   more than the first photo too, without needing another schema change.
 --------------------------------------------------------------------------
 """
 
@@ -383,6 +132,20 @@ WF_FIELD_AIRTABLE_ID       = "airtable-record-id"
 WF_FIELD_SUPABASE_ID       = "supabase-garment-id"
 WF_FIELD_IMAGE_1           = "main-photo"        # NOT "image-1" — confirmed real slug
 
+# 2026-08 (revision note 9): full Airtable-attachment-field -> Webflow-
+# image-slug map, confirmed live via GET /v2/collections/{id}. Image 8 in
+# Airtable is deliberately absent — the Webflow collection only has 7
+# image slots, there's nowhere for it to go.
+IMAGE_FIELD_MAP = {
+    "Image 1": "main-photo",
+    "Image 2": "image-2",
+    "Image 3": "model-back",
+    "Image 4": "image-3",
+    "Image 5": "image-4",
+    "Image 6": "image-5",
+    "Image 7": "image-7",
+}
+
 # Designer is a single-reference field (Webflow's panel shows "(Reference)",
 # not "(Multi-reference)") — payload is a plain item ID string, not an array.
 WF_FIELD_DESIGNER_REF      = "designers"  # CONFIRMED SLUG, CONFIRMED single-reference
@@ -452,10 +215,15 @@ FULL_SYNC = os.environ.get("FULL_SYNC", "false").lower() == "true"
 # "Name (Formula)" can't be tracked directly (formula fields have no
 # modified time) — its inputs (Garment Name, Product Colour) are listed
 # instead. If that formula ever gains another input, add it here.
+#
+# 2026-08 (revision note 9): now includes every field in IMAGE_FIELD_MAP,
+# not just Image 1 — otherwise a garment whose only change was adding
+# Image 4/5/6/7 in Airtable would never be picked up by an incremental
+# run.
 MODIFIED_TRACKED_FIELDS = [
     FLD_GARMENT_NAME, FLD_DESIGNER, FLD_COLLECTION, FLD_PRODUCT_CODE,
-    FLD_PRODUCT_COLOUR, FLD_CATEGORY, FLD_RRP, FLD_IMAGE_1,
-]
+    FLD_PRODUCT_COLOUR, FLD_CATEGORY, FLD_RRP,
+] + list(IMAGE_FIELD_MAP.keys())
 
 # Seconds to sleep between pages when paginating a full Webflow
 # collection fetch. 1.1s keeps the fetch at ~54 requests/minute — safely
@@ -467,14 +235,6 @@ WEBFLOW_PAGINATION_SLEEP = 1.1
 
 # ── Airtable helpers ─────────────────────────────────────────────────────
 def airtable_request(method, url, json_body=None, params=None, max_retries=5):
-    """Shared retry-with-backoff wrapper for Airtable writes — mirrors
-    webflow_request()'s handling of 429/5xx. Added 2026-07 after tracing
-    the garment-duplication bug back to this call having NO retry
-    protection: a transient Airtable rate-limit hit here would silently
-    drop the Webflow-Item-ID write-back after a successful create,
-    leaving Airtable's field blank even though a live Webflow item
-    existed — which caused the next run to create a second item for the
-    same garment (see revision notes 6 and 8 at the top of this file)."""
     for attempt in range(max_retries):
         res = requests.request(method, url, headers=AIRTABLE_HEADERS,
                                json=json_body, params=params, timeout=30)
@@ -483,7 +243,7 @@ def airtable_request(method, url, json_body=None, params=None, max_retries=5):
         if res.status_code == 429 or res.status_code >= 500:
             wait = int(res.headers.get("Retry-After", 5 * (attempt + 1)))
             print(f"  Airtable {res.status_code} on {method} {url} — waiting {wait}s, retry {attempt + 1}/{max_retries}")
-            time.sleep(wait + 1)  # +1s margin so we don't re-hit the window boundary exactly
+            time.sleep(wait + 1)
             continue
         raise requests.exceptions.HTTPError(
             f"{res.status_code} on {method} {url}: {res.text[:500]} | payload: {json_body}",
@@ -513,16 +273,9 @@ def airtable_fetch_all(table, filter_formula=None, fields=None):
         if not offset:
             break
 
-    # Defensive dedup: Airtable's offset pagination can return the same
-    # record twice if that record's fields change WHILE a long fetch is
-    # still in progress (e.g. new_listings.py/listings_sync.py touching a
-    # garment mid-fetch, entirely plausible over a multi-hour run against
-    # ~6,000+ records). This caused a real duplicate Webflow item create
-    # in production — the same Airtable record processed twice from one
-    # stale in-memory fetch, both passes seeing a blank Webflow Item ID.
     seen = {}
     for r in records:
-        seen[r["id"]] = r  # last occurrence wins; fields should be identical either way
+        seen[r["id"]] = r
     deduped = list(seen.values())
     if len(deduped) != len(records):
         print(f"  NOTE: {table} fetch returned {len(records)} rows, "
@@ -531,13 +284,6 @@ def airtable_fetch_all(table, filter_formula=None, fields=None):
 
 
 def airtable_update(table, record_id, fields):
-    """Writes back to Airtable (e.g. a new Webflow Item ID after create).
-    Routed through airtable_request() for 429/5xx retry — see revision
-    note 6. This call used to be a bare requests.patch() with no retry
-    handling at all, which was the actual root cause of the garment
-    duplication bug: a dropped write-back here left Airtable's Webflow
-    Item ID blank even though the Webflow item had been created
-    successfully, so the next run treated the garment as never-created."""
     if DRY_RUN:
         print(f"  [DRY RUN] would update Airtable {table}/{record_id} with {fields}")
         return {"id": record_id, "fields": fields}
@@ -548,9 +294,6 @@ def airtable_update(table, record_id, fields):
 
 # ── Incremental sync helpers ─────────────────────────────────────────────
 def read_last_sync_timestamp():
-    """Returns the ISO timestamp string from the last successful run, or
-    None (meaning: full sync) if the file is missing/empty/unreadable or
-    FULL_SYNC=true was passed."""
     if FULL_SYNC:
         print("FULL_SYNC=true — ignoring last-sync timestamp, processing all qualifying garments.")
         return None
@@ -559,8 +302,6 @@ def read_last_sync_timestamp():
             ts = fp.read().strip()
         if not ts:
             return None
-        # Sanity check it parses — a corrupted file should mean "full
-        # sync", never a malformed formula sent to Airtable.
         datetime.fromisoformat(ts.replace("Z", "+00:00"))
         return ts
     except FileNotFoundError:
@@ -581,14 +322,6 @@ def write_last_sync_timestamp(ts):
 
 
 def get_modified_garment_ids(last_sync_iso):
-    """One extra server-side Airtable fetch returning the record IDs of
-    garments that need processing this run:
-      - blank Webflow Item ID (never created — always process), OR
-      - any MODIFIED_TRACKED_FIELDS field changed since last_sync_iso.
-
-    Uses a field-scoped LAST_MODIFIED_TIME() so only changes to the
-    fields we actually push to Webflow count (see config notes). Fetches
-    just one lightweight field since only the IDs are needed."""
     scoped_fields = ", ".join("{" + fld + "}" for fld in MODIFIED_TRACKED_FIELDS)
     formula = (
         f"OR({{{FLD_WEBFLOW_ITEM_ID}}}='', "
@@ -600,9 +333,6 @@ def get_modified_garment_ids(last_sync_iso):
 
 # ── Supabase helper ──────────────────────────────────────────────────────
 def get_supabase_garment_uuid(airtable_id):
-    """Look up the Supabase garments.id (uuid) for a given Airtable record ID.
-    Returns None if no matching row exists yet (expected for garments that
-    only qualify via Product Code and have never had a sighting synced)."""
     url = f"{SUPABASE_URL}/rest/v1/garments?airtable_id=eq.{airtable_id}&select=id"
     res = requests.get(url, headers=SUPABASE_HEADERS, timeout=15)
     res.raise_for_status()
@@ -611,14 +341,6 @@ def get_supabase_garment_uuid(airtable_id):
 
 
 def update_supabase_garment_slug(supabase_uuid, slug):
-    """Keeps Supabase's garments.slug in sync with Webflow's real slug on
-    every run. Best effort — a failure here logs a warning but doesn't
-    fail the whole garment sync, since Webflow itself (the source of
-    truth) is already correctly updated regardless. Now that build_slug()
-    guarantees uniqueness against live Webflow slugs (see revision notes
-    at the top of this file), this should no longer hit Supabase's own
-    unique constraint on garments.slug either — the same corrected,
-    collision-free slug is what gets written here."""
     if DRY_RUN:
         print(f"  [DRY RUN] would update Supabase garments.slug for {supabase_uuid} -> {slug}")
         return
@@ -629,16 +351,6 @@ def update_supabase_garment_slug(supabase_uuid, slug):
 
 
 def update_supabase_garment_image(supabase_uuid, image_url):
-    """Keeps Supabase's garments.image_url in sync on every run — same
-    best-effort pattern as update_supabase_garment_slug (log-and-continue
-    on failure, never fail the garment).
-
-    2026-07 FIX: this call didn't exist before. field_data[WF_FIELD_IMAGE_1]
-    was being sent TO Webflow on every create/update, but the resulting
-    URL was never written back to Supabase, so garments.image_url sat
-    null forever and search_garments()/the /find results page rendered
-    broken image icons on every card — including for garments that were
-    correctly synced in every other respect."""
     if not image_url:
         return
     if DRY_RUN:
@@ -651,19 +363,6 @@ def update_supabase_garment_image(supabase_uuid, image_url):
 
 
 def update_supabase_garment_webflow_id(supabase_uuid, webflow_item_id):
-    """Keeps Supabase's garments.webflow_item_id in sync on every run —
-    same best-effort pattern as update_supabase_garment_slug/image
-    (log-and-continue on failure, never fail the garment).
-
-    2026-08 FIX: this call didn't exist before. search_garments() filters
-    to `webflow_item_id is not null`, so any garment whose Supabase row
-    was created with this column blank was permanently invisible in site
-    search even while fully live and published on Webflow — confirmed
-    6,819 of ~7,000 garments affected. See revision note 7 at the top of
-    this file. This closes the gap going forward; the ~6,819 already-
-    affected rows need a separate one-time backfill (see
-    backfill_webflow_item_id.py, which sources the correct value from
-    garments.json rather than re-querying Airtable/Webflow)."""
     if not webflow_item_id:
         return
     if DRY_RUN:
@@ -677,13 +376,6 @@ def update_supabase_garment_webflow_id(supabase_uuid, webflow_item_id):
 
 # ── Cloudflare KV helper (redirects) ─────────────────────────────────────
 def kv_write_redirect(old_slug, new_slug, path_prefix="/garments/"):
-    """Writes redirect:{path_prefix}{old_slug} -> {path_prefix}{new_slug} so
-    any already-indexed/bookmarked URL 301s instead of 404ing. Defaults to
-    /garments/ (what worker.js currently handles) — pass a different
-    path_prefix for other collections, but note: worker.js's redirect
-    logic must ALSO be extended to check that prefix, or a redirect
-    written here will simply never be looked up. As of this writing,
-    worker.js only checks paths starting with /garments/."""
     key = f"redirect:{path_prefix}{old_slug}"
     value = f"{path_prefix}{new_slug}"
     if DRY_RUN:
@@ -705,20 +397,6 @@ def kv_write_redirect(old_slug, new_slug, path_prefix="/garments/"):
 
 # ── Slug logic ────────────────────────────────────────────────────────────
 def strip_accents(text):
-    """Transliterate accented/diacritic Unicode characters to their closest
-    plain-ASCII equivalent, e.g. 'é' -> 'e', 'á' -> 'a', 'Dámour' -> 'Damour'.
-
-    Implemented via stdlib unicodedata (no external dependency like
-    unidecode required). NFKD decomposition splits each accented character
-    into a base letter + a separate combining-mark codepoint; encoding to
-    ASCII with errors='ignore' then drops the combining marks, leaving just
-    the base letter behind.
-
-    This does NOT handle every possible Unicode edge case (e.g. characters
-    with no decomposable base letter, like 'ø' or 'æ', pass through as
-    empty/unchanged) — but it covers the standard Latin diacritics that
-    have actually caused failures in production (é, á, ê, etc.).
-    """
     normalized = unicodedata.normalize("NFKD", text)
     return normalized.encode("ascii", "ignore").decode("ascii")
 
@@ -735,13 +413,6 @@ def slugify(text):
 
 
 def base_slug_for_garment(name_formula, fallback_name):
-    """Plain, un-disambiguated slugify of the garment's name — no
-    fallback chain, no uniqueness enforcement. Used ONLY for the
-    pre-check against existing_slugs in sync_garments() (revision note
-    8) so a garment can be matched against its own already-live item
-    BEFORE build_slug()'s fallback logic runs and potentially invents a
-    slug that was never actually live. build_slug() remains the single
-    source of truth for the slug that's actually written to Webflow."""
     base = name_formula or fallback_name or ""
     slug = slugify(base)
     if not slug:
@@ -750,34 +421,6 @@ def base_slug_for_garment(name_formula, fallback_name):
 
 
 def build_slug(record_id, name_formula, fallback_name, product_code, existing_slugs, self_wf_id=None):
-    """Single source of truth: slugify the Name (Formula) field.
-
-    Deliberately does NOT append Product Colour separately — Name
-    (Formula) is trusted as-is, whatever it produces (with colour
-    appended when present, bare name when not — e.g. for Alemais, which
-    has no Product Colour data at all).
-
-    Uniqueness is enforced in code, not by manual pre-run checking:
-    existing_slugs is a dict of {slug: webflow_item_id} for every item
-    currently live in the Garments collection (loaded once at the start
-    of sync_garments(), and kept updated as this run creates/updates
-    items, so collisions between two brand-new items in the same run are
-    also caught). self_wf_id is this garment's own existing (or newly
-    adopted — see revision note 8) Webflow item ID, if any — so a
-    garment being re-synced with the same slug it already has isn't
-    flagged as colliding with itself. CALLERS MUST resolve self_wf_id
-    (including adopting a matching live item by base slug, if
-    applicable) BEFORE calling this — see base_slug_for_garment() and
-    the adoption step in sync_garments().
-
-    Fallback chain if the base slug is taken by a *different* item:
-      1. base slug + slugified Product Code (if Product Code is set)
-      2. base slug + numeric suffix (-2, -3, ...) — guaranteed unique,
-         used when Product Code is blank/still collides.
-
-    If Name (Formula) is somehow blank, falls back to the raw Garment
-    Name plus a short id suffix so slugs never collide outright.
-    """
     slug = base_slug_for_garment(name_formula, fallback_name)
     if len(slug) < 3:
         slug = f"{slug}-{record_id[-8:].lower()}"
@@ -804,21 +447,6 @@ def build_slug(record_id, name_formula, fallback_name, product_code, existing_sl
 
 # ── Webflow helpers ───────────────────────────────────────────────────────
 def webflow_request(method, url, json_body=None, params=None, max_retries=5, allow_404=False):
-    """Shared retry-with-backoff wrapper for EVERY Webflow API call in this
-    script — reads and writes alike. Handles 429 (rate limit, respects
-    Retry-After) and 5xx (transient) with backoff. Raises with the real
-    response body on any other failure, or after retries are exhausted.
-
-    allow_404=True returns None on a 404 instead of raising — used by
-    webflow_get_item, where "item was deleted on the Webflow side" is an
-    expected condition that triggers a recreate, not an error.
-
-    This exists because a single uncaught 429 has now killed a full
-    production run three times (sync_garments before the wrapper existed,
-    sync_campaigns which hadn't been covered yet, and the slug-preload
-    pagination in webflow_all_items which was still calling requests.get
-    directly). No call site in this file may call requests.* against
-    api.webflow.com directly — everything goes through here."""
     for attempt in range(max_retries):
         res = requests.request(method, url, headers=WEBFLOW_HEADERS,
                                json=json_body, params=params, timeout=30)
@@ -829,9 +457,8 @@ def webflow_request(method, url, json_body=None, params=None, max_retries=5, all
         if res.status_code == 429 or res.status_code >= 500:
             wait = int(res.headers.get("Retry-After", 5 * (attempt + 1)))
             print(f"  Webflow {res.status_code} on {method} {url} — waiting {wait}s, retry {attempt + 1}/{max_retries}")
-            time.sleep(wait + 1)  # +1s margin so we don't re-hit the window boundary exactly
+            time.sleep(wait + 1)
             continue
-        # Non-retryable (400, 404 when not allowed, etc.) — fail immediately with detail
         raise requests.exceptions.HTTPError(
             f"{res.status_code} on {method} {url}: {res.text[:500]} | payload: {json_body}",
             response=res,
@@ -861,10 +488,6 @@ def webflow_update_item(collection_id, item_id, field_data):
 
 
 def webflow_get_item(collection_id, item_id):
-    """Fetch a single item. Returns None on 404 (item deleted on the
-    Webflow side — an expected condition, handled upstream by recreating
-    the item). Routed through webflow_request like everything else, so
-    429s here are retried instead of killing the run."""
     res = webflow_request(
         "GET",
         f"https://api.webflow.com/v2/collections/{collection_id}/items/{item_id}",
@@ -874,10 +497,6 @@ def webflow_get_item(collection_id, item_id):
 
 
 def webflow_undraft_item(collection_id, item_id):
-    """Un-draft a single item. Uses the individual item PATCH endpoint —
-    NEVER the per-collection /items/publish batch endpoint, which is what
-    caused the ~2,862-failure rate-limit incident during the last rebuild
-    attempt."""
     if DRY_RUN:
         print(f"  [DRY RUN] would un-draft item {item_id} in {collection_id}")
         return {"id": item_id, "isDraft": False}
@@ -887,14 +506,6 @@ def webflow_undraft_item(collection_id, item_id):
 
 
 def webflow_site_publish():
-    """ONE single site-wide publish call at the very end of the run —
-    not per-item, not per-collection batch.
-
-    Webflow's v2 publish endpoint requires an explicit list of custom
-    domain IDs to publish to — publishToWebflowSubdomain:False alone
-    (with no customDomains) gives it zero valid targets and fails with
-    'You must pass at least one valid domain id'. Fetch the site's real
-    domain IDs first rather than guessing."""
     if DRY_RUN:
         print("  [DRY RUN] would trigger single site-wide publish")
         return {"queued": True, "dryRun": True}
@@ -916,17 +527,6 @@ def webflow_site_publish():
 
 
 def webflow_all_items(collection_id):
-    """Paginate through every item in a collection.
-
-    Two rate-limit protections (see revision note 3 at the top of this
-    file — the unprotected version of this exact function is what killed
-    the last production run with a 429 at offset 2200):
-      1. Each page request goes through webflow_request(), so a 429 waits
-         out Retry-After and retries instead of raising.
-      2. A proactive WEBFLOW_PAGINATION_SLEEP between pages keeps the
-         fetch itself under ~54 req/min, so the retry path is a safety
-         net rather than the normal flow.
-    """
     items, offset, limit = [], 0, 100
     while True:
         res = webflow_request(
@@ -959,9 +559,6 @@ def get_in_feed_designers():
 
 # ── Step 2: which garments qualify for a Webflow page ────────────────────
 def get_qualifying_garment_ids():
-    """Returns the set of Airtable Garment record IDs that currently have
-    an Active or Sold sighting — used to combine with the Product Code
-    condition below."""
     records = airtable_fetch_all(
         SIGHTINGS_TABLE,
         filter_formula='OR({Status}="Active",{Status}="Sold")',
@@ -983,8 +580,8 @@ def get_qualifying_garments(in_feed_designers):
         fields=[
             FLD_GARMENT_NAME, FLD_NAME_FORMULA, FLD_DESIGNER, FLD_COLLECTION,
             FLD_PRODUCT_CODE, FLD_PRODUCT_COLOUR, FLD_CATEGORY, FLD_RRP,
-            FLD_IMAGE_1, FLD_AIRTABLE_SLUG, FLD_WEBFLOW_ITEM_ID,
-        ],
+            FLD_AIRTABLE_SLUG, FLD_WEBFLOW_ITEM_ID,
+        ] + list(IMAGE_FIELD_MAP.keys()),
     )
 
     qualifying = []
@@ -993,16 +590,8 @@ def get_qualifying_garments(in_feed_designers):
         designer = f.get(FLD_DESIGNER)
         if designer not in in_feed_designers:
             continue
-        has_collection = bool(f.get(FLD_COLLECTION))  # linked record field — empty list/None if unset
-        has_image = bool(f.get(FLD_IMAGE_1))  # Airtable attachment field: empty list/None if no image
-        # Deliberately simple, unconditional rule: Collection assigned AND
-        # Image 1 present. No exceptions (sighting history alone used to
-        # qualify a garment even without an image — that's gone). This is
-        # intentional: it exactly matches the campaign table's own
-        # row-inclusion criteria (see worker.js's /garments endpoint),
-        # guaranteeing that anything ever shown in a campaign table is
-        # guaranteed to have a real page behind it — no more silent
-        # mismatches between "shown as a row" and "actually clickable."
+        has_collection = bool(f.get(FLD_COLLECTION))
+        has_image = bool(f.get(FLD_IMAGE_1))
         if has_collection and has_image:
             qualifying.append(r)
 
@@ -1025,13 +614,6 @@ def get_qualifying_garments(in_feed_designers):
 
 # ── Step 3: sync Designers (no drafting, create-once) ────────────────────
 def sync_designers():
-    """Ensures every in-feed designer has a Webflow item. Returns a map of
-    designer NAME (string) -> Webflow item ID.
-
-    Keyed by name rather than Airtable record ID because Garments.Designer
-    is a plain text field, NOT a linked record to the Designers table —
-    so name is the only join key available when building each garment's
-    single-reference value below."""
     records = airtable_fetch_all(
         DESIGNERS_TABLE,
         filter_formula="{In Feed}=1",
@@ -1062,7 +644,6 @@ def sync_designers():
                     webflow_update_item(DESIGNERS_COLLECTION_ID, existing_wf_id, field_data)
                     designer_webflow_ids[name] = existing_wf_id
                     continue
-                # stale Webflow Item ID (deleted on Webflow side) — recreate below
 
             created = webflow_create_item(DESIGNERS_COLLECTION_ID, field_data)
             new_id = created["id"]
@@ -1099,7 +680,7 @@ def sync_campaigns(qualifying_garments):
         if r["id"] in collection_ids_needed
     }
 
-    campaign_webflow_ids = {}  # airtable collection record id -> webflow item id
+    campaign_webflow_ids = {}
     failures = []
 
     for airtable_id, record in campaign_records.items():
@@ -1108,10 +689,6 @@ def sync_campaigns(qualifying_garments):
         try:
             existing_wf_id = f.get(FLD_WEBFLOW_ITEM_ID)
 
-            # Airtable Lookup fields always return an array, even for a single
-            # linked value (e.g. ['Aje']) — but Webflow's Designer Name field is
-            # Plain Text, not a list. Flatten before sending, or every campaign
-            # update fails validation on a real (non-dry) run.
             designer_raw = f.get("Designer Name") or f.get("Designer") or ""
             designer_name = ", ".join(designer_raw) if isinstance(designer_raw, list) else designer_raw
 
@@ -1134,7 +711,6 @@ def sync_campaigns(qualifying_garments):
                         kv_write_redirect(old_slug, new_slug, path_prefix=CAMPAIGN_URL_PREFIX)
                         print(f"  Campaign slug changed: {old_slug} -> {new_slug} (redirect written)")
                     continue
-                # Webflow Item ID was stale (item deleted on Webflow side) — recreate below
 
             created = webflow_create_item(CAMPAIGNS_COLLECTION_ID, field_data)
             new_id = created["id"]
@@ -1156,25 +732,8 @@ def sync_campaigns(qualifying_garments):
     return campaign_webflow_ids
 
 
-# ── Step 4.5: reconcile already-orphaned items (blank Airtable ID but ──────
-#              a live Webflow item already references this record) ────────
+# ── Step 4.5: reconcile already-orphaned items ────────────────────────────
 def reconcile_orphaned_items(existing_items):
-    """Scans every live Webflow Garments item's Airtable Record ID field
-    (WF_FIELD_AIRTABLE_ID) and, for any whose Airtable record still has a
-    blank Webflow Item ID, backfills Airtable directly.
-
-    Added 2026-08 (revision note 8) as a startup safety net: this catches
-    garments already left orphaned by the ordering bug in a *previous*
-    run, independent of slug matching, before this run's own sync loop
-    even starts. Uses the existing_items list already fetched by
-    sync_garments() for slug-collision loading — no extra Webflow calls.
-
-    If a garment's live item has more than one candidate (shouldn't
-    happen given build_slug()'s uniqueness guarantee, but Webflow doesn't
-    enforce uniqueness on WF_FIELD_AIRTABLE_ID itself), the first one
-    encountered wins and a warning is printed — that scenario points at a
-    genuine duplicate needing manual review, not something this pass
-    should silently resolve on its own."""
     print("Reconciling orphaned Webflow items against Airtable...")
 
     webflow_by_airtable_id = {}
@@ -1216,9 +775,6 @@ def reconcile_orphaned_items(existing_items):
 # ── Step 5: sync Garments ─────────────────────────────────────────────────
 def sync_garments(qualifying_garments, campaign_webflow_ids, designer_webflow_ids):
     if not qualifying_garments:
-        # Common on incremental runs with a quiet day in Airtable — skip
-        # the ~70-request slug preload entirely, there's nothing to
-        # collision-check against.
         print("No garments to process this run — skipping slug preload and garment sync.")
         return [], []
 
@@ -1231,9 +787,6 @@ def sync_garments(qualifying_garments, campaign_webflow_ids, designer_webflow_id
             existing_slugs[s] = item["id"]
     print(f"  {len(existing_slugs)} existing slugs loaded from {len(existing_items)} live items")
 
-    # Revision note 8: catch any garments already left orphaned by a
-    # previous run's write-back failure, independent of this run's slug
-    # logic, before processing begins.
     reconcile_orphaned_items(existing_items)
 
     synced = []
@@ -1250,16 +803,6 @@ def sync_garments(qualifying_garments, campaign_webflow_ids, designer_webflow_id
             existing_wf_id = f.get(FLD_WEBFLOW_ITEM_ID)
             existing_item = None
 
-            # REVISION NOTE 8 — adopt BEFORE computing the real slug, not
-            # after. If Airtable's Webflow Item ID is blank (e.g. a prior
-            # write-back failed), check whether this garment's plain,
-            # un-disambiguated base slug is already live on Webflow. If
-            # so, that live item almost certainly IS this garment —
-            # adopt its ID as existing_wf_id right now, so build_slug()
-            # below receives the correct self_wf_id and returns the
-              # slug already in use (rather than inventing a new one that
-            # was never live, which is what silently let duplicates
-            # through before this fix).
             if not existing_wf_id:
                 candidate_base = base_slug_for_garment(name_formula, garment_name)
                 adopted_wf_id = existing_slugs.get(candidate_base)
@@ -1278,15 +821,9 @@ def sync_garments(qualifying_garments, campaign_webflow_ids, designer_webflow_id
                 existing_slugs, self_wf_id=existing_wf_id,
             )
 
-            # Normal path: existing_wf_id came from Airtable directly
-            # (not adopted above) — fetch it if we haven't already.
             if existing_wf_id and existing_item is None:
                 existing_item = webflow_get_item(GARMENTS_COLLECTION_ID, existing_wf_id)
 
-            # Belt-and-braces: even after the adoption step above, still
-            # check the FINAL computed slug against existing_slugs in
-            # case some other path led here with no existing_item found
-            # yet. Cheap and harmless if it never fires.
             if not existing_item and new_slug in existing_slugs:
                 adopted_wf_id = existing_slugs[new_slug]
                 fetched = webflow_get_item(GARMENTS_COLLECTION_ID, adopted_wf_id)
@@ -1297,7 +834,7 @@ def sync_garments(qualifying_garments, campaign_webflow_ids, designer_webflow_id
                           f"slug '{new_slug}' already exists as {adopted_wf_id} — adopting.")
                     airtable_update(GARMENTS_TABLE, airtable_id, {FLD_WEBFLOW_ITEM_ID: adopted_wf_id})
 
-            supabase_uuid = get_supabase_garment_uuid(airtable_id)  # may be None — see module docstring
+            supabase_uuid = get_supabase_garment_uuid(airtable_id)
             if supabase_uuid:
                 update_supabase_garment_slug(supabase_uuid, new_slug)
 
@@ -1327,13 +864,21 @@ def sync_garments(qualifying_garments, campaign_webflow_ids, designer_webflow_id
             if campaign_wf_id:
                 field_data[WF_FIELD_CAMPAIGN_REF] = campaign_wf_id
             if designer_wf_id:
-                field_data[WF_FIELD_DESIGNER_REF] = designer_wf_id  # single-reference — plain item ID string
+                field_data[WF_FIELD_DESIGNER_REF] = designer_wf_id
 
-            image_url = None
-            img_field = f.get(FLD_IMAGE_1)
-            if img_field and isinstance(img_field, list) and img_field[0].get("url"):
-                image_url = img_field[0]["url"]
-                field_data[WF_FIELD_IMAGE_1] = {"url": image_url}
+            # 2026-08 FIX (revision note 9): loop over every Airtable image
+            # field -> Webflow slug pair, instead of only ever sending
+            # Image 1. image_urls collects what was actually sent, keyed
+            # by Airtable field name, so the post-write CDN-URL swap below
+            # can do the same "prefer Webflow's own hosted URL" fix for
+            # every image slot, not just the first.
+            image_urls = {}
+            for at_field, wf_slug in IMAGE_FIELD_MAP.items():
+                img_field = f.get(at_field)
+                if img_field and isinstance(img_field, list) and img_field[0].get("url"):
+                    url = img_field[0]["url"]
+                    image_urls[at_field] = url
+                    field_data[wf_slug] = {"url": url}
 
             if existing_item:
                 old_slug = existing_item.get("fieldData", {}).get(WF_FIELD_SLUG)
@@ -1348,36 +893,27 @@ def sync_garments(qualifying_garments, campaign_webflow_ids, designer_webflow_id
                 airtable_update(GARMENTS_TABLE, airtable_id, {FLD_WEBFLOW_ITEM_ID: wf_item_id})
                 webflow_undraft_item(GARMENTS_COLLECTION_ID, wf_item_id)
 
-            # 2026-07 FIX: use Webflow's own hosted CDN URL for the image,
-            # not the Airtable attachment URL computed above. Airtable
-            # attachment URLs are signed and expire — they are NOT the
-            # "permanent, no expiry" asset the rest of this pipeline
-            # (garments.json, Supabase) assumes. Webflow's response
-            # echoes back the real, permanent CDN URL once the image has
-            # been created/updated, so prefer that whenever it's present;
-            # fall back to the Airtable URL only if Webflow's response is
-            # missing it for some reason (e.g. DRY_RUN, where no real
-            # Webflow write happened).
-            webflow_image_url = (update_res or {}).get("fieldData", {}).get(WF_FIELD_IMAGE_1, {})
-            if isinstance(webflow_image_url, dict) and webflow_image_url.get("url"):
-                image_url = webflow_image_url["url"]
+            # Prefer Webflow's own hosted CDN URL over Airtable's signed,
+            # expiring attachment URL — for EVERY image slot that was
+            # sent, not just main-photo. Webflow echoes the resolved CDN
+            # URL back in fieldData for each image field once attached.
+            response_field_data = (update_res or {}).get("fieldData", {})
+            for at_field, wf_slug in IMAGE_FIELD_MAP.items():
+                if at_field not in image_urls:
+                    continue
+                echoed = response_field_data.get(wf_slug, {})
+                if isinstance(echoed, dict) and echoed.get("url"):
+                    image_urls[at_field] = echoed["url"]
+
+            # Keep the existing single "image_url" as Image 1's URL (main-
+            # photo) for backward compatibility with garments.json/
+            # Supabase consumers that only ever expected one image.
+            image_url = image_urls.get(FLD_IMAGE_1)
 
             if supabase_uuid:
                 update_supabase_garment_image(supabase_uuid, image_url)
-                # 2026-08 FIX (revision note 7): the one write-back that
-                # was missing entirely — see update_supabase_garment_
-                # webflow_id()'s own docstring for why this mattered.
-                # Applies on BOTH the create and update paths: wf_item_id
-                # is set either way by this point (freshly created above,
-                # adopted via the collision-recovery fallback, or the
-                # pre-existing existing_wf_id for a normal update), and
-                # any of those could still be missing from Supabase even
-                # if Airtable itself already had the correct ID.
                 update_supabase_garment_webflow_id(supabase_uuid, wf_item_id)
 
-            # Register this slug immediately so a later garment in the same
-            # run — including any that previously collided with THIS one
-            # before it existed — sees it as taken too.
             existing_slugs[new_slug] = wf_item_id
 
             synced.append({
@@ -1391,19 +927,17 @@ def sync_garments(qualifying_garments, campaign_webflow_ids, designer_webflow_id
                 "category": f.get(FLD_CATEGORY, ""),
                 "colour": f.get(FLD_PRODUCT_COLOUR, ""),
                 "rrp": f.get(FLD_RRP),
-                # Webflow's own hosted CDN asset URL — permanent, no
-                # expiry, no Supabase Storage needed. (Prior to the
-                # 2026-07 fix this was actually Airtable's signed,
-                # expiring attachment URL — see note above.)
                 "image_url": image_url,
+                # 2026-08 (revision note 9): every synced image, in
+                # Airtable-field-name order, for any future consumer
+                # (garments.json, garment page gallery) that wants more
+                # than just the first photo.
+                "image_urls": [image_urls[k] for k in IMAGE_FIELD_MAP if k in image_urls],
             })
 
         except Exception as e:
             failures.append({"airtable_id": airtable_id, "name": display_name, "error": str(e)})
             print(f"  FAILED garment {airtable_id} ({display_name}): {e}")
-            # Deliberately no re-raise — one bad record should never take
-            # down the other ~5,000+ in the same run. See failures summary
-            # at the end for what needs manual attention.
 
         time.sleep(0.15)
 
@@ -1426,13 +960,6 @@ def publish_site():
 
 # ── Step 6: garments.json export (merge, not overwrite) ──────────────────
 def export_garments_json(synced_garments):
-    """Merges this run's synced garments into the existing garments.json
-    rather than overwriting it. On an incremental run only a handful of
-    garments are processed — overwriting would shrink the search index
-    down to just that handful. Existing entries are kept as-is unless
-    this run produced a newer version of the same garment (keyed by
-    Airtable record ID). No removal pass: garments are create-once-
-    permanent, so entries never need to disappear."""
     existing = []
     try:
         with open(GARMENTS_JSON_PATH) as fp:
@@ -1441,7 +968,7 @@ def export_garments_json(synced_garments):
             print(f"WARNING: {GARMENTS_JSON_PATH} wasn't a list — starting fresh.")
             existing = []
     except FileNotFoundError:
-        pass  # first run / file not committed yet — fresh export
+        pass
     except (json.JSONDecodeError, OSError) as e:
         print(f"WARNING: couldn't read existing {GARMENTS_JSON_PATH} ({e}) — starting fresh.")
         existing = []
@@ -1460,6 +987,7 @@ def export_garments_json(synced_garments):
             "product_code": g["product_code"],
             "rrp": g["rrp"],
             "image": g["image_url"],
+            "images": g.get("image_urls", []),
             "search": " ".join(filter(None, [g["designer"], g["name"], g["colour"], g["product_code"]])).lower(),
         }
 
@@ -1477,10 +1005,6 @@ def main():
     if DRY_RUN:
         print("*** DRY RUN MODE — no Webflow/Airtable/KV writes will actually happen ***")
 
-    # Captured BEFORE any Airtable fetch — this becomes the next run's
-    # cutoff, so records edited while this run is in flight fall on the
-    # right side of the window next time (they may just get synced twice,
-    # which is harmless).
     run_started_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     last_sync_iso = read_last_sync_timestamp()
 
@@ -1494,17 +1018,9 @@ def main():
         print("No qualifying garments found — aborting, this looks wrong.")
         sys.exit(1)
 
-    # Campaigns/Designers ALWAYS sync from the FULL qualifying set —
-    # they're a few dozen items, and campaign scope must not depend on
-    # which garments happen to be in this run's modified window (or a
-    # campaign referenced only by unmodified garments would silently
-    # stop receiving updates).
     campaign_webflow_ids = sync_campaigns(qualifying_garments)
     designer_webflow_ids = sync_designers()
 
-    # Garments sync INCREMENTALLY: only ones modified since the last
-    # successful run (per field-scoped LAST_MODIFIED_TIME) or never yet
-    # created in Webflow. See revision note 4.
     if last_sync_iso:
         modified_ids = get_modified_garment_ids(last_sync_iso)
         garments_to_process = [r for r in qualifying_garments if r["id"] in modified_ids]
@@ -1519,18 +1035,8 @@ def main():
         garments_to_process, campaign_webflow_ids, designer_webflow_ids
     )
 
-    # Export garments.json FIRST — this data is valuable on its own and
-    # shouldn't be held hostage by an unrelated publish failure (which is
-    # exactly what happened on a previous run: publish crashed, and the
-    # json export — the very last line of the script — never ran at all,
-    # despite ~5,478 garments having synced successfully beforehand).
     export_garments_json(synced_garments)
 
-    # Advance the incremental cutoff ONLY if every garment in this run's
-    # window succeeded — otherwise keep the old timestamp so the failed
-    # ones land back inside the modified window next run and get retried
-    # automatically (the successful ones in the same window just get
-    # re-updated once, which is harmless).
     if not garment_failures:
         write_last_sync_timestamp(run_started_iso)
     else:
