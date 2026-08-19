@@ -48081,7 +48081,7 @@
     "category": "Other",
     "colour": "Classic Wash",
     "product_code": "",
-    "rrp": 0,
+    "rrp": 295,
     "image": "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a5978144a0a231157771095_nGiXHT8TBV2jhRW9Vdd70MwrI9OpVNBmLRcw5CsGDIk.jpeg",
     "images": [
       "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a5978144a0a231157771095_nGiXHT8TBV2jhRW9Vdd70MwrI9OpVNBmLRcw5CsGDIk.jpeg"
@@ -58062,8 +58062,9 @@
     "colour": "Black",
     "product_code": "24SS4086",
     "rrp": 295,
-    "image": "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a4efc4014323c1b316ef8d0_u7eaqhGzURMkDiDAZ7wjnl0be99_NCJgFEDY_sPwwJI.jpeg",
+    "image": "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a85961ad4232816fcce4be6_jBBEWvFGRglDoE5PcSRYPLL634t9m3-TeslqXpE7XzM.webp",
     "images": [
+      "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a85961ad4232816fcce4be6_jBBEWvFGRglDoE5PcSRYPLL634t9m3-TeslqXpE7XzM.webp",
       "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a4efc4014323c1b316ef8d0_u7eaqhGzURMkDiDAZ7wjnl0be99_NCJgFEDY_sPwwJI.jpeg"
     ],
     "search": "aje resolution knit midi skirt - black black 24ss4086"
@@ -66761,11 +66762,11 @@
     "id": "recXloZEFQUqN320a",
     "webflow_item_id": "6a52e8b54f3f80abb5b7ea1e",
     "name": "Danica Tie Back Midi Dress - Black",
-    "slug": "danica-tie-back-midi-dress-black-2",
+    "slug": "danica-tie-back-midi-dress-black-24re5467",
     "designer": "Aje",
     "category": "Dresses",
     "colour": "Black",
-    "product_code": "",
+    "product_code": "24RE5467",
     "rrp": null,
     "image": "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a52de86881128c2cabe3887_ZMDBR-OHXcZ4ruOC0HFyvVypCCMuL2lw8tHC8clvj3c.jpeg",
     "images": [
@@ -66774,7 +66775,7 @@
       "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a7e52f89aae5492d523ca38_g0EZkmL9ITIGJE2989PDdzsMF7bXyE60M91AFB07jmY.jpeg",
       "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a7e52f89aae5492d523ca3b_3lJutnmocoaYREu2Up_c0C33MJyZID2t9hY_8pVIFtc.jpeg"
     ],
-    "search": "aje danica tie back midi dress - black black"
+    "search": "aje danica tie back midi dress - black black 24re5467"
   },
   {
     "id": "recXm1Tq7Y7SCTaL8",
@@ -131522,5 +131523,22 @@
       "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a84e1302720d52e37049076_7TCbS5FpgebIC0J5E-RkcMq3FMYHfHwZ1yygQPePMQA.webp"
     ],
     "search": "aje presence twisted midi dress - ivory ivory 25re5070"
+  },
+  {
+    "id": "rec1l2IvN6FrZBB3q",
+    "webflow_item_id": "6a859613e130a2b35f2f0984",
+    "name": "Lola Denim Midi Skirt - Black",
+    "slug": "lola-denim-midi-skirt-black",
+    "designer": "Aje",
+    "category": "Bottoms",
+    "colour": "Black",
+    "product_code": "23SS4080",
+    "rrp": 375,
+    "image": "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a859613e130a2b35f2f0971_w9Q2uavo1nwb3b00Tdwf8MifbXXrRI4Oh91XEUsP2nY.webp",
+    "images": [
+      "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a859613e130a2b35f2f0971_w9Q2uavo1nwb3b00Tdwf8MifbXXrRI4Oh91XEUsP2nY.webp",
+      "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a859613e130a2b35f2f096d_nenx1y4V097TBRmsoi6cws0lRAP-J4Wu58oLsx70n_M.webp"
+    ],
+    "search": "aje lola denim midi skirt - black black 23ss4080"
   }
 ]
