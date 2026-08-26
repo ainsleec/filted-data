@@ -109857,8 +109857,9 @@
     "colour": "Sunset Orange",
     "product_code": "24RE5459",
     "rrp": 575,
-    "image": "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a502ae205cd68a3a8ac622d_ZCd9jctzf87onC6eNMI_gxGcW_lFpTSUN6MXMSBzD9Y.jpeg",
+    "image": "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a8ed12f40c569084b799ace_dtB9GWu3LQqCxXqi7yUa-DYtdz_5RWOqDknYukWP_78.webp",
     "images": [
+      "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a8ed12f40c569084b799ace_dtB9GWu3LQqCxXqi7yUa-DYtdz_5RWOqDknYukWP_78.webp",
       "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a502ae205cd68a3a8ac622d_ZCd9jctzf87onC6eNMI_gxGcW_lFpTSUN6MXMSBzD9Y.jpeg"
     ],
     "search": "aje filigree sweetheart midi dress - sunset orange sunset orange 24re5459"
@@ -123451,8 +123452,8 @@
   {
     "id": "reczofx6jx3wyg89D",
     "webflow_item_id": "6a52ff199538f5ffd59cc367",
-    "name": "\u200bPsychedelia Crop Turtle Jumper  - Black",
-    "slug": "psychedelia-crop-turtle-jumper-black-2",
+    "name": "\u200bPsychedelia Crop Turtle Neck Jumper  - Black",
+    "slug": "psychedelia-crop-turtle-neck-jumper-black",
     "designer": "Aje",
     "category": "Other",
     "colour": "Black",
@@ -123462,7 +123463,7 @@
     "images": [
       "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a53b2eb2b3e046025c76ec6_ImZ9SHhP1L5S5VHOPkuJyVaQ3F0OZSBpI-GlkvAWfmw.jpeg"
     ],
-    "search": "aje \u200bpsychedelia crop turtle jumper  - black black"
+    "search": "aje \u200bpsychedelia crop turtle neck jumper  - black black"
   },
   {
     "id": "reczoys8P2wFCkWKV",
@@ -127098,13 +127099,13 @@
     "designer": "Aje",
     "category": "Dresses",
     "colour": "Black",
-    "product_code": "",
+    "product_code": "24AW5228",
     "rrp": null,
     "image": "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a659f5bbfb949b38a791db7_vHACYdYENTSqxTP9KEfJzROxk8O0D1a-0uPRfgERHrg.webp",
     "images": [
       "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a659f5bbfb949b38a791db7_vHACYdYENTSqxTP9KEfJzROxk8O0D1a-0uPRfgERHrg.webp"
     ],
-    "search": "aje zeitgeist knit mini dress - black black"
+    "search": "aje zeitgeist knit mini dress - black black 24aw5228"
   },
   {
     "id": "rechxCGMMTIex3r3S",
@@ -131590,5 +131591,55 @@
       "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a8d7f62c198c057677a179e_o0MMGUavJB0EI8m5wokezhWFHIF8n-PghTtA3Tfs0Ts.webp"
     ],
     "search": "aje liza logo knit jumper - grey marl/ivory grey marl/ivory 25pf1445"
+  },
+  {
+    "id": "recV8TPDoD7rtSvlx",
+    "webflow_item_id": "6a8ed12487e8ebf7ca5c0496",
+    "name": "\u200bPsychedelia Crop Turtleneck Jumper  - Ivory",
+    "slug": "psychedelia-crop-turtleneck-jumper-ivory",
+    "designer": "Aje",
+    "category": "Other",
+    "colour": "Ivory",
+    "product_code": "",
+    "rrp": null,
+    "image": "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a8ed12487e8ebf7ca5c0446_gCaZlLQVx9As80OfkLeGY2uOgHA1DRcQyPmHrFfOpsI.webp",
+    "images": [
+      "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a8ed12487e8ebf7ca5c0446_gCaZlLQVx9As80OfkLeGY2uOgHA1DRcQyPmHrFfOpsI.webp"
+    ],
+    "search": "aje \u200bpsychedelia crop turtleneck jumper  - ivory ivory"
+  },
+  {
+    "id": "recgwgmmCFxedTO4A",
+    "webflow_item_id": "6a8ed1289d5438669dc598b2",
+    "name": "Filigree Sweetheart Midi Dress - Biege",
+    "slug": "filigree-sweetheart-midi-dress-biege",
+    "designer": "Aje",
+    "category": "Dresses",
+    "colour": "Biege",
+    "product_code": "",
+    "rrp": 575,
+    "image": "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a8ed1289d5438669dc598ad_LcDsVT_cpsohDMNQAzd6LGIJuXwzqJqVBFVWYiEOqeQ.webp",
+    "images": [
+      "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a8ed1289d5438669dc598ad_LcDsVT_cpsohDMNQAzd6LGIJuXwzqJqVBFVWYiEOqeQ.webp",
+      "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a8ed1289d5438669dc598aa_bQtmjXfMCzokF85IVvMEYDulIca6-_unDTifDDdJcfI.webp"
+    ],
+    "search": "aje filigree sweetheart midi dress - biege biege"
+  },
+  {
+    "id": "recxmml6LIAuBdPMN",
+    "webflow_item_id": "6a8ed133879099c0766a915d",
+    "name": "Filigree Sweetheart Midi Dress - Ivory  ",
+    "slug": "filigree-sweetheart-midi-dress-ivory",
+    "designer": "Aje",
+    "category": "Dresses",
+    "colour": "Ivory  ",
+    "product_code": "",
+    "rrp": 575,
+    "image": "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a8ed133879099c0766a90ea_PRTq2gaKUxVQXgd74Juv8vVzQiU409CmHHhTCfvsaIo.webp",
+    "images": [
+      "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a8ed133879099c0766a90ea_PRTq2gaKUxVQXgd74Juv8vVzQiU409CmHHhTCfvsaIo.webp",
+      "https://cdn.prod.website-files.com/68774161bf3d68b09728926a/6a8ed133879099c0766a90ed_pSpfoakl4cXFx0BXfL8awsUgl7b_rQWn45cXK96h6Nc.webp"
+    ],
+    "search": "aje filigree sweetheart midi dress - ivory   ivory  "
   }
 ]
