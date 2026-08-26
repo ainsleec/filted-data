@@ -28,7 +28,7 @@ jobs:
           EBAY_APP_ID: ${{ secrets.EBAY_APP_ID }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
-        run: python scrape_ebay_swimwear.py
+        run: python scripts/scrape_ebay_swimwear.py
       
       - name: Log summary
         if: always()
