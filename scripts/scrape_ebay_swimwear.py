@@ -2,6 +2,7 @@
 """
 Scrape boutique swimwear listings from eBay and store in Supabase.
 Runs daily via GitHub Actions.
+Uses existing GitHub secrets: EBAY_APP_ID, SUPABASE_URL, SUPABASE_ANON_KEY
 """
 
 import os
@@ -13,7 +14,7 @@ from supabase import create_client, Client
 # ── Config ──────────────────────────────────────────────────────────────────
 EBAY_APP_ID = os.getenv('EBAY_APP_ID')
 SUPABASE_URL = os.getenv('SUPABASE_URL')
-SUPABASE_KEY = os.getenv('SUPABASE_KEY')
+SUPABASE_KEY = os.getenv('SUPABASE_ANON_KEY')  # Using ANON_KEY from secrets
 
 BRANDS = [
     'Ochre Lane',
@@ -59,7 +60,7 @@ def query_ebay(brand: str) -> list:
         'itemFilter(0).value(1)': '4000',  # Like New
         'itemFilter(0).value(2)': '5000',  # Excellent
         'itemFilter(1).name': 'ListingType',
-        'itemFilter(1).value': 'FixedPrice',  # Fixed price only (no auctions)
+        'itemFilter(1).value': 'FixedPrice',
         'itemFilter(2).name': 'Currency',
         'itemFilter(2).value': 'AUD',
         'itemFilter(3).name': 'Location',
