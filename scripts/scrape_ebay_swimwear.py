@@ -53,7 +53,7 @@ def query_ebay(brand: str) -> list:
         'SECURITY-APPNAME': EBAY_APP_ID,
         'RESPONSE-DATA-FORMAT': 'JSON',
         'REST-PAYLOAD': True,
-        'keywords': f'{brand} swimwear -mens -boys -vintage -retro',
+        'keywords': f'{brand} -mens -boys -vintage -retro',
         'categoryId': CATEGORY_ID,
         'itemFilter(0).name': 'Condition',
         'itemFilter(0).value(0)': '3000',  # New
