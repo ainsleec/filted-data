@@ -76,8 +76,8 @@ EBAY_CLIENT_SECRET  = os.environ["EBAY_CLIENT_SECRET"]
 
 # ── eBay strict settings ──────────────────────────────────────────────────────
 EBAY_WOMENS_CAT     = "15724"    # eBay AU: Women's Clothing — no other categories
-LOOKBACK_HOURS      = 72         # Runs twice daily, 14hr window with overlap
-MAX_PER_DESIGNER    = 100        # Cap per designer per run
+LOOKBACK_HOURS      = 720         # Runs twice daily, 14hr window with overlap
+MAX_PER_DESIGNER    = 500        # Cap per designer per run
 
 # Listings must genuinely be located in Australia. eBay's own
 # itemLocationCountry filter (in search_ebay() below) is the first pass;
